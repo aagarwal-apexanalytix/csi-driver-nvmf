@@ -111,7 +111,7 @@ func (cs *ControllerServer) executeCommand(cmd string) error {
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		klog.Errorf("Backend returned error status %d for command '%s': %s", resp.StatusCode, cmd, string(respBody))
+		klog.Errorf("Backend returned error status %d for command '%s': body=%s", resp.StatusCode, cmd, string(respBody))
 		return fmt.Errorf("execute error: status %d, body: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -133,7 +133,7 @@ func (cs *ControllerServer) restGet(path string) ([]map[string]interface{}, erro
 		return nil, fmt.Errorf("backend REST URL not configured")
 	}
 
-	klog.V(5).Infof("Performing REST GET: %s", cs.restURL+path)
+	klog.V(5).Infof("Performing REST GET: %s%s", cs.restURL, path)
 
 	req, err := http.NewRequest("GET", cs.restURL+path, nil)
 	if err != nil {
@@ -148,13 +148,14 @@ func (cs *ControllerServer) restGet(path string) ([]map[string]interface{}, erro
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		klog.Errorf("REST GET error for %s: status %d", path, resp.StatusCode)
-		return nil, fmt.Errorf("GET error: %d", resp.StatusCode)
+		klog.Errorf("REST GET error for %s: status %d, body=%s", path, resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("GET error: %d, body: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result []map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(respBody)).Decode(&result); err != nil {
 		klog.Errorf("Failed to decode REST GET response for %s: %v", path, err)
 		return nil, err
 	}
@@ -181,7 +182,7 @@ func parseSizeToBytes(s string) int64 {
 	return int64(f * 1024 * 1024 * 1024)
 }
 
-// Check if volume/slot exists and return size (driver-wide config)
+// Check if volume/slot exists and return size
 func (cs *ControllerServer) volumeExists(volumeID string) (bool, int64, error) {
 	klog.V(5).Infof("Checking existence of volume/slot %s", volumeID)
 
@@ -255,11 +256,10 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	var currentSize int64
 
 	if cs.provider == ProviderStatic {
-		// Static mode: assume pre-created, size unknown
 		exists = true
 		currentSize = 0
 	} else {
-		// Dynamic mode: credential / REST URL override support (per-StorageClass with ENV fallback)
+		// Dynamic mode: credential / REST URL override support
 		localRestURL := params["restURL"]
 		if localRestURL == "" {
 			localRestURL = cs.restURL
@@ -284,7 +284,10 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			return nil, status.Error(codes.InvalidArgument, "password required (in StorageClass parameters or BACKEND_PASSWORD env)")
 		}
 
-		// Local restGet for idempotency check
+		// Debug logging for credentials (password length only)
+		klog.V(4).Infof("Using MikroTik REST API: url=%s, username=%s, password_length=%d", localRestURL, localUsername, len(localPassword))
+
+		// Local restGet with improved error logging
 		localRestGet := func(path string) ([]map[string]interface{}, error) {
 			klog.V(5).Infof("Performing local REST GET: %s%s", localRestURL, path)
 			req, err := http.NewRequest("GET", localRestURL+path, nil)
@@ -292,17 +295,23 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 				return nil, err
 			}
 			req.SetBasicAuth(localUsername, localPassword)
+
 			resp, err := cs.client.Do(req)
 			if err != nil {
 				klog.Errorf("Local REST GET failed for %s: %v", path, err)
 				return nil, err
 			}
 			defer resp.Body.Close()
+
+			respBody, _ := io.ReadAll(resp.Body)
 			if resp.StatusCode != 200 {
-				return nil, fmt.Errorf("local GET error: %d", resp.StatusCode)
+				klog.Errorf("Local REST GET error for %s: status %d, body=%s", path, resp.StatusCode, string(respBody))
+				return nil, fmt.Errorf("local GET error: %d, body: %s", resp.StatusCode, string(respBody))
 			}
+
 			var result []map[string]interface{}
-			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			if err := json.NewDecoder(bytes.NewReader(respBody)).Decode(&result); err != nil {
+				klog.Errorf("Failed to decode local REST GET response for %s: %v", path, err)
 				return nil, err
 			}
 			return result, nil
@@ -312,6 +321,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "Failed to list disks for idempotency check: %v", err)
 		}
+
 		for _, d := range disks {
 			if s, ok := d["slot"].(string); ok && s == volumeID {
 				sizeStr, _ := d["file-size"].(string)
@@ -321,28 +331,32 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			}
 		}
 
-		// Local executeCommand for provisioning
+		// Local executeCommand with improved error logging
 		localExecute := func(cmd string) error {
 			klog.V(5).Infof("Executing local backend command: %s", cmd)
 			body := map[string]string{"command": cmd}
 			jsonBody, _ := json.Marshal(body)
+
 			req, err := http.NewRequest("POST", localRestURL+"/execute", bytes.NewReader(jsonBody))
 			if err != nil {
 				return err
 			}
 			req.SetBasicAuth(localUsername, localPassword)
 			req.Header.Set("Content-Type", "application/json")
+
 			resp, err := cs.client.Do(req)
 			if err != nil {
 				klog.Errorf("Local HTTP request failed for command '%s': %v", cmd, err)
 				return fmt.Errorf("HTTP request failed: %w", err)
 			}
 			defer resp.Body.Close()
+
 			respBody, _ := io.ReadAll(resp.Body)
 			if resp.StatusCode >= 300 {
-				klog.Errorf("Local backend error status %d for command '%s': %s", resp.StatusCode, cmd, string(respBody))
+				klog.Errorf("Local backend error status %d for command '%s': body=%s", resp.StatusCode, cmd, string(respBody))
 				return fmt.Errorf("execute error: status %d, body: %s", resp.StatusCode, string(respBody))
 			}
+
 			var result map[string]interface{}
 			if json.Unmarshal(respBody, &result) == nil {
 				if errMsg, ok := result["error"].(string); ok && errMsg != "" {
@@ -350,11 +364,12 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 					return fmt.Errorf("command failed: %s", errMsg)
 				}
 			}
+
 			klog.V(5).Infof("Local backend command succeeded: %s", cmd)
 			return nil
 		}
 
-		// Idempotency using local check
+		// Idempotency check
 		if exists {
 			if currentSize >= capBytes {
 				klog.V(4).Infof("Volume %s already exists with sufficient size (%d >= %d bytes)", volumeID, currentSize, capBytes)
@@ -430,9 +445,9 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		}, nil
 	}
 
-	// Static provider path (after common idempotency for static)
+	// Static provider path
 	if exists {
-		if currentSize >= capBytes { // currentSize=0 for static
+		if currentSize >= capBytes {
 			return &csi.CreateVolumeResponse{
 				Volume: &csi.Volume{
 					VolumeId:      volumeID,
@@ -471,7 +486,7 @@ func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
 	slot := volumeID
 	subVolName := "vol-" + volumeID
 
-	// Best-effort cleanup (driver-wide credentials)
+	// Best-effort cleanup
 	klog.V(4).Infof("Disabling NVMe-TCP export for slot %s", slot)
 	_ = cs.executeCommand(fmt.Sprintf("/disk set %s nvme-tcp-export=no", slot))
 
@@ -540,13 +555,16 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesReq
 		if !strings.HasPrefix(slot, "pvc-") {
 			continue
 		}
+
 		exportInter, _ := d["nvme-tcp-export"]
 		export, _ := exportInter.(string)
 		if export != "yes" {
 			continue
 		}
+
 		sizeStr, _ := d["file-size"].(string)
 		capBytes := parseSizeToBytes(sizeStr)
+
 		entries = append(entries, &csi.ListVolumesResponse_Entry{
 			Volume: &csi.Volume{
 				VolumeId:      slot,
@@ -676,7 +694,6 @@ func (cs *ControllerServer) CreateSnapshot(_ context.Context, req *csi.CreateSna
 
 	params := req.Parameters
 
-	// Credential / REST URL override (same logic as CreateVolume)
 	localRestURL := params["restURL"]
 	if localRestURL == "" {
 		localRestURL = cs.restURL
@@ -701,7 +718,6 @@ func (cs *ControllerServer) CreateSnapshot(_ context.Context, req *csi.CreateSna
 		return nil, status.Error(codes.InvalidArgument, "password required")
 	}
 
-	// Optional backendDisk override for snapshot
 	backendDisk := params["backendDisk"]
 	if backendDisk == "" {
 		backendDisk = cs.backendDisk
@@ -714,21 +730,25 @@ func (cs *ControllerServer) CreateSnapshot(_ context.Context, req *csi.CreateSna
 		klog.V(5).Infof("Executing local backend command (snapshot): %s", cmd)
 		body := map[string]string{"command": cmd}
 		jsonBody, _ := json.Marshal(body)
+
 		req, err := http.NewRequest("POST", localRestURL+"/execute", bytes.NewReader(jsonBody))
 		if err != nil {
 			return err
 		}
 		req.SetBasicAuth(localUsername, localPassword)
 		req.Header.Set("Content-Type", "application/json")
+
 		resp, err := cs.client.Do(req)
 		if err != nil {
 			return fmt.Errorf("HTTP request failed: %w", err)
 		}
 		defer resp.Body.Close()
+
 		respBody, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("execute error: status %d, body: %s", resp.StatusCode, string(respBody))
 		}
+
 		var result map[string]interface{}
 		if json.Unmarshal(respBody, &result) == nil {
 			if errMsg, ok := result["error"].(string); ok && errMsg != "" {
