@@ -191,7 +191,7 @@ func (cs *ControllerServer) volumeExists(volumeID string) (bool, int64, error) {
 		return true, 0, nil
 	}
 
-	disks, err := cs.restGet("/rest/disk")
+	disks, err := cs.restGet("/disk")
 	if err != nil {
 		return false, 0, err
 	}
@@ -317,7 +317,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			return result, nil
 		}
 
-		disks, err := localRestGet("/rest/disk")
+		disks, err := localRestGet("/disk")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "Failed to list disks for idempotency check: %v", err)
 		}
@@ -540,7 +540,7 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesReq
 		return &csi.ListVolumesResponse{Entries: []*csi.ListVolumesResponse_Entry{}}, nil
 	}
 
-	disks, err := cs.restGet("/rest/disk")
+	disks, err := cs.restGet("/disk")
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "List disks failed: %v", err)
 	}
@@ -586,7 +586,7 @@ func (cs *ControllerServer) GetCapacity(_ context.Context, _ *csi.GetCapacityReq
 		return &csi.GetCapacityResponse{AvailableCapacity: 0}, nil
 	}
 
-	disks, err := cs.restGet("/rest/disk")
+	disks, err := cs.restGet("/disk")
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Capacity query failed: %v", err)
 	}
