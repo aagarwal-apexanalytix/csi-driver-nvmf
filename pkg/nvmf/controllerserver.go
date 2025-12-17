@@ -81,7 +81,7 @@ func (cs *ControllerServer) initConfig() {
 	}
 }
 
-// Generic REST helper - takes full URL and credentials
+// Generic REST helper
 func (cs *ControllerServer) restDo(method, url string, body []byte, username, password string) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
@@ -145,6 +145,24 @@ func (cs *ControllerServer) restPatch(path string, data map[string]string, restU
 func (cs *ControllerServer) restDelete(path, restURL, username, password string) error {
 	_, err := cs.restDo("DELETE", restURL+path, nil, username, password)
 	return err
+}
+
+// Get .id for a disk by slot
+func (cs *ControllerServer) getDiskID(slot, restURL, username, password string) (string, error) {
+	disks, err := cs.restGet("/disk", restURL, username, password)
+	if err != nil {
+		return "", err
+	}
+
+	for _, d := range disks {
+		if s, ok := d["slot"].(string); ok && s == slot {
+			id, ok := d[".id"].(string)
+			if ok && id != "" {
+				return id, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("disk with slot %s not found or missing .id", slot)
 }
 
 // Parse size string to bytes
@@ -226,7 +244,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		backendMount = cs.backendMount
 	}
 
-	volumeID := "pvc-" + strings.ReplaceAll(strings.ToLower(req.Name), "-", "")
+	volumeID := strings.ReplaceAll(strings.ToLower(req.Name), "-", "")
 	slot := volumeID
 	subVolName := "vol-" + volumeID
 	imgPath := backendMount + "/" + subVolName + "/volume.img"
@@ -264,7 +282,6 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		}, nil
 	}
 
-	// Dynamic mode - per-StorageClass credentials
 	localRestURL := params["restURL"]
 	if localRestURL == "" {
 		localRestURL = cs.restURL
@@ -317,7 +334,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 
 	klog.V(4).Infof("Provisioning new volume %s (slot=%s, size=%s, fromSnapshot=%s)", req.Name, slot, sizeGiB, fromSnapshot)
 
-	// Create BTRFS subvolume via POST /disk/btrfs/subvolume/add
+	// Create BTRFS subvolume
 	subvolData := map[string]string{
 		"fs":   backendDisk,
 		"name": subVolName,
@@ -328,14 +345,14 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	}
 	err = cs.restPost("/disk/btrfs/subvolume/add", subvolData, localRestURL, localUsername, localPassword)
 	if err != nil {
-		if strings.Contains(err.Error(), "File exists") || strings.Contains(err.Error(), "already exists") {
-			klog.V(4).Infof("Subvolume %s already exists (treating as idempotent)", subVolName)
+		if strings.Contains(err.Error(), "exists") || strings.Contains(err.Error(), "File exists") {
+			klog.V(4).Infof("Subvolume %s already exists (idempotent)", subVolName)
 		} else {
 			return nil, status.Errorf(codes.Internal, "Subvolume create failed: %v", err)
 		}
 	}
 
-	// Create file-backed disk via POST /disk/add
+	// Create file-backed disk
 	diskData := map[string]string{
 		"type":      "file",
 		"file-path": imgPath,
@@ -343,28 +360,37 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		"slot":      slot,
 	}
 	if err := cs.restPost("/disk/add", diskData, localRestURL, localUsername, localPassword); err != nil {
-		// Best-effort cleanup
 		_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
-		return nil, status.Errorf(codes.Internal, ".img create failed: %v", err)
+		return nil, status.Errorf(codes.Internal, "Disk create failed: %v", err)
 	}
 
-	// Enable NVMe-TCP export - try PATCH first, fallback to POST /disk/set
+	// Get .id for reliable addressing
+	diskID, err := cs.getDiskID(slot, localRestURL, localUsername, localPassword)
+	if err != nil {
+		// Best-effort cleanup using slot fallback
+		_ = cs.restDelete("/disk/"+slot, localRestURL, localUsername, localPassword)
+		_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
+		return nil, status.Errorf(codes.Internal, "Failed to retrieve disk .id for export: %v", err)
+	}
+
+	// Enable NVMe-TCP export using .id
 	exportData := map[string]string{
 		"nvme-tcp-export": "yes",
 		"nvme-tcp-port":   targetPort,
 	}
-	err = cs.restPatch("/disk/"+slot, exportData, localRestURL, localUsername, localPassword)
+	err = cs.restPatch("/disk/"+diskID, exportData, localRestURL, localUsername, localPassword)
 	if err != nil {
+		klog.Warningf("PATCH export by .id failed, trying SET by .id: %v", err)
 		setData := map[string]string{
-			"numbers":         slot,
+			"numbers":         diskID,
 			"nvme-tcp-export": "yes",
 			"nvme-tcp-port":   targetPort,
 		}
 		if err2 := cs.restPost("/disk/set", setData, localRestURL, localUsername, localPassword); err2 != nil {
-			// Cleanup on failure
-			_ = cs.restDelete("/disk/"+slot, localRestURL, localUsername, localPassword)
+			// Cleanup
+			_ = cs.restDelete("/disk/"+diskID, localRestURL, localUsername, localPassword)
 			_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
-			return nil, status.Errorf(codes.Internal, "Export enable failed (PATCH: %v, SET: %v)", err, err2)
+			return nil, status.Errorf(codes.Internal, "Export enable failed (PATCH .id: %v, SET .id: %v)", err, err2)
 		}
 	}
 
@@ -402,9 +428,18 @@ func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
 	slot := volumeID
 	subVolName := "vol-" + volumeID
 
-	// Best-effort cleanup
-	_ = cs.restPatch("/disk/"+slot, map[string]string{"nvme-tcp-export": "no"}, cs.restURL, cs.username, cs.password)
-	_ = cs.restDelete("/disk/"+slot, cs.restURL, cs.username, cs.password)
+	// Best-effort disable export
+	diskID, _ := cs.getDiskID(slot, cs.restURL, cs.username, cs.password)
+	if diskID != "" {
+		_ = cs.restPatch("/disk/"+diskID, map[string]string{"nvme-tcp-export": "no"}, cs.restURL, cs.username, cs.password)
+		_ = cs.restDelete("/disk/"+diskID, cs.restURL, cs.username, cs.password)
+	} else {
+		// Fallback to slot
+		_ = cs.restPatch("/disk/"+slot, map[string]string{"nvme-tcp-export": "no"}, cs.restURL, cs.username, cs.password)
+		_ = cs.restDelete("/disk/"+slot, cs.restURL, cs.username, cs.password)
+	}
+
+	// Delete subvolume
 	_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, cs.restURL, cs.username, cs.password)
 
 	klog.V(4).Infof("Deletion completed for volume %s (best-effort)", volumeID)
@@ -432,14 +467,21 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 
 	newGiB := fmt.Sprintf("%dG", newBytes/(1024*1024*1024))
 
-	// Try PATCH first, fallback to POST /disk/set
-	err := cs.restPatch("/disk/"+slot, map[string]string{"file-size": newGiB}, cs.restURL, cs.username, cs.password)
+	// Get .id
+	diskID, err := cs.getDiskID(slot, cs.restURL, cs.username, cs.password)
 	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to get disk .id for expansion: %v", err)
+	}
+
+	// Try PATCH by .id
+	err = cs.restPatch("/disk/"+diskID, map[string]string{"file-size": newGiB}, cs.restURL, cs.username, cs.password)
+	if err != nil {
+		// Fallback SET by .id
 		if err2 := cs.restPost("/disk/set", map[string]string{
-			"numbers":   slot,
+			"numbers":   diskID,
 			"file-size": newGiB,
 		}, cs.restURL, cs.username, cs.password); err2 != nil {
-			return nil, status.Errorf(codes.Internal, "Expand failed (PATCH: %v, SET: %v)", err, err2)
+			return nil, status.Errorf(codes.Internal, "Expand failed (PATCH .id: %v, SET .id: %v)", err, err2)
 		}
 	}
 
@@ -465,7 +507,7 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesReq
 	var entries []*csi.ListVolumesResponse_Entry
 	for _, d := range disks {
 		slot, _ := d["slot"].(string)
-		if slot == "" || !strings.HasPrefix(slot, "pvc-") {
+		if slot == "" || !strings.HasPrefix(slot, "pvc") {
 			continue
 		}
 
