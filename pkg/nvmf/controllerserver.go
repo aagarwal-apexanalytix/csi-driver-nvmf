@@ -277,6 +277,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 					"targetTrPort": targetPort,
 					"targetTrType": "tcp",
 					"nqn":          slot,
+					"deviceID":     slot,
 				},
 			},
 		}, nil
@@ -325,6 +326,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 						"targetTrPort": targetPort,
 						"targetTrType": "tcp",
 						"nqn":          slot,
+						"deviceID":     slot,
 					},
 				},
 			}, nil
