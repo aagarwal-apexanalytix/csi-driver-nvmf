@@ -1,6 +1,4 @@
-/*
-Copyright 2021 The Kubernetes Authors.
-
+/* Copyright 2021 The Kubernetes Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -24,59 +22,56 @@ import (
 	"strings"
 )
 
-// IsFileExisting check file exist in volume driver
+// IsFileExisting checks if a file exists.
+// Returns true only if the file exists and is accessible.
+// Returns false if it does not exist or on other errors (e.g., permission denied).
 func IsFileExisting(filename string) bool {
 	_, err := os.Stat(filename)
-	if err == nil {
-		return true
-	}
-	// Notice: this err may be is not dictionary error, it will returns true
-	if os.IsNotExist(err) {
-		return false
-	}
-	return true
+	return err == nil
 }
 
+// ParseEndpoint parses a CSI endpoint string (unix://path or tcp://addr:port).
+// Returns protocol and address, or error if invalid.
 func ParseEndpoint(ep string) (string, string, error) {
-	if strings.HasPrefix(strings.ToLower(ep), "unix://") || strings.HasPrefix(strings.ToLower(ep), "tcp://") {
+	epLower := strings.ToLower(ep)
+	if strings.HasPrefix(epLower, "unix://") || strings.HasPrefix(epLower, "tcp://") {
 		s := strings.SplitN(ep, "://", 2)
-		if s[1] != "" {
+		if len(s) == 2 && s[1] != "" {
 			return s[0], s[1], nil
 		}
 	}
-	return "", "", fmt.Errorf("Invalid endpoint: %v", ep)
+	return "", "", fmt.Errorf("invalid endpoint: %v", ep)
 }
 
-func WriteStringToFile(file *os.File, data string) (err error) {
-	write := bufio.NewWriter(file)
-	size, err := write.WriteString(data)
-	if err != nil {
-		return err
-	} else if size == 0 {
-		return fmt.Errorf("write nothing")
-	}
-	err = write.Flush()
+// WriteStringToFile writes a string to an open file and flushes.
+func WriteStringToFile(file *os.File, data string) error {
+	writer := bufio.NewWriter(file)
+	size, err := writer.WriteString(data + "\n") // Add newline for fabrics convention
 	if err != nil {
 		return err
 	}
-	return nil
+	if size == 0 {
+		return fmt.Errorf("wrote zero bytes")
+	}
+	return writer.Flush()
 }
 
-func ReadLinesFromFile(file *os.File) (lines []string, err error) {
+// ReadLinesFromFile reads all lines from an open file (e.g., sysfs attributes).
+// Trims whitespace and stops on EOF.
+func ReadLinesFromFile(file *os.File) ([]string, error) {
+	var lines []string
 	reader := bufio.NewReader(file)
-	if reader.Size() < 0 {
-		return nil, fmt.Errorf("Failed to read from %s ", file.Name())
-	}
 
 	for {
 		line, err := reader.ReadString('\n')
-		lines = append(lines, strings.TrimSpace(line))
+		if line != "" {
+			lines = append(lines, strings.TrimSpace(line))
+		}
 		if err != nil {
 			if err == io.EOF {
 				return lines, nil
-			} else {
-				return nil, err
 			}
+			return lines, err
 		}
 	}
 }

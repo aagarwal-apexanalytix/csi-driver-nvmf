@@ -1,6 +1,4 @@
-/*
-Copyright 2021 The Kubernetes Authors.
-
+/* Copyright 2021 The Kubernetes Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -33,6 +31,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// waitForPathToExist polls until a device path appears (used during NVMe connection)
 func waitForPathToExist(devicePath string, maxRetries, intervalSeconds int, deviceTransport string) (bool, error) {
 	for i := 0; i < maxRetries; i++ {
 		exist := utils.IsFileExisting(devicePath)
@@ -47,9 +46,11 @@ func waitForPathToExist(devicePath string, maxRetries, intervalSeconds int, devi
 	return false, fmt.Errorf("not found devicePath %s and transport %s", devicePath, deviceTransport)
 }
 
-// getNvmeInfoByNqn discovers the controller and raw device path for a given subsystem NQN
+// getNvmeInfoByNqn discovers the controller and raw device path for a given subsystem NQN.
+// This is NVMe-oF specific and only used for NVMe-provisioned volumes (provisionMode: "nvme").
 func getNvmeInfoByNqn(nqn string) (controller string, devicePath string, err error) {
 	const ctlPath = "/sys/class/nvme-fabrics/ctl"
+
 	entries, err := os.ReadDir(ctlPath)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to read %s: %w", ctlPath, err)
@@ -80,7 +81,6 @@ func getNvmeInfoByNqn(nqn string) (controller string, devicePath string, err err
 				if !strings.HasPrefix(nsName, "nvme") || !strings.Contains(nsName, "n") {
 					continue
 				}
-
 				// Extract namespace ID: everything after the last "n"
 				lastNIdx := strings.LastIndex(nsName, "n")
 				if lastNIdx == -1 || lastNIdx+1 >= len(nsName) {
@@ -102,6 +102,8 @@ func getNvmeInfoByNqn(nqn string) (controller string, devicePath string, err err
 	return "", "", fmt.Errorf("no controller found for NQN %s", nqn)
 }
 
+// GetDeviceNameByVolumeID returns the local device path for a given volume ID (NQN).
+// NVMe-specific – not used for NFS RWX volumes.
 func GetDeviceNameByVolumeID(volumeID string) (string, error) {
 	_, devicePath, err := getNvmeInfoByNqn(volumeID)
 	if err != nil {
@@ -110,7 +112,8 @@ func GetDeviceNameByVolumeID(volumeID string) (string, error) {
 	return devicePath, nil
 }
 
-// parseDeviceToControllerPath returns the correct rescan path for NVMe-oF fabrics controllers
+// parseDeviceToControllerPath returns the correct rescan path for NVMe-oF fabrics controllers.
+// NVMe-specific – used during online expansion.
 func parseDeviceToControllerPath(volumeID string) (string, error) {
 	controller, _, err := getNvmeInfoByNqn(volumeID)
 	if err != nil {
@@ -119,9 +122,11 @@ func parseDeviceToControllerPath(volumeID string) (string, error) {
 	return filepath.Join("/sys/class/nvme-fabrics/ctl", controller, "rescan_controller"), nil
 }
 
+// logGRPC is a unary interceptor for logging gRPC requests/responses (general utility)
 func logGRPC(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	klog.Infof("GRPC call: %s", info.FullMethod)
 	klog.Infof("GRPC request: %s", protosanitizer.StripSecrets(req))
+
 	resp, err := handler(ctx, req)
 	if err != nil {
 		klog.Errorf("GRPC error: %v", err)
@@ -131,6 +136,7 @@ func logGRPC(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, h
 	return resp, err
 }
 
+// Rollback executes a cleanup function on error (general utility)
 func Rollback(err error, fc func()) {
 	if err != nil {
 		if fc != nil {

@@ -1,6 +1,4 @@
-/*
-Copyright 2021 The Kubernetes Authors.
-
+/* Copyright 2021 The Kubernetes Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -58,6 +56,7 @@ func (ids *IdentityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*c
 
 func (ids *IdentityServer) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
 	klog.V(5).Infof("Identity: getPluginCapabilities ")
+
 	resp := &csi.GetPluginCapabilitiesResponse{
 		Capabilities: []*csi.PluginCapability{
 			{
@@ -70,7 +69,7 @@ func (ids *IdentityServer) GetPluginCapabilities(ctx context.Context, req *csi.G
 			{
 				Type: &csi.PluginCapability_VolumeExpansion_{
 					VolumeExpansion: &csi.PluginCapability_VolumeExpansion{
-						Type: csi.PluginCapability_VolumeExpansion_OFFLINE,
+						Type: csi.PluginCapability_VolumeExpansion_ONLINE,
 					},
 				},
 			},

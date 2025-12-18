@@ -1,6 +1,4 @@
-/*
-Copyright 2021 The Kubernetes Authors.
-
+/* Copyright 2021 The Kubernetes Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -24,13 +22,11 @@ import (
 )
 
 type driver struct {
-	name    string
-	nodeId  string
-	version string
-
-	region       string
-	volumeMapDir string
-
+	name             string
+	nodeId           string
+	version          string
+	region           string
+	volumeMapDir     string
 	idServer         *IdentityServer
 	nodeServer       *NodeServer
 	controllerServer *ControllerServer
@@ -39,7 +35,7 @@ type driver struct {
 	cscap []*csi.ControllerServiceCapability
 }
 
-// NewDriver create the identity/node
+// NewDriver creates the identity/node/controller servers
 func NewDriver(conf *GlobalConfig) *driver {
 	if conf.DriverName == "" {
 		klog.Fatalf("driverName not been specified")
@@ -47,6 +43,7 @@ func NewDriver(conf *GlobalConfig) *driver {
 	}
 
 	klog.Infof("Driver: %v version: %v", conf.DriverName, conf.Version)
+
 	return &driver{
 		name:         conf.DriverName,
 		version:      conf.Version,
@@ -57,11 +54,22 @@ func NewDriver(conf *GlobalConfig) *driver {
 }
 
 func (d *driver) Run(conf *GlobalConfig) {
-	d.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{})
+	// Advertise supported volume access modes (RWO, RWX, RWOP)
 	d.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
 		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+	})
+
+	// Note: CREATE_DELETE_SNAPSHOT and LIST_SNAPSHOTS are conditional in GetCapabilities (static mode disables them)
+	d.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{
+		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
+		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
+		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
+		csi.ControllerServiceCapability_RPC_GET_VOLUME,
+		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
+		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 	})
 
 	d.idServer = NewIdentityServer(d)

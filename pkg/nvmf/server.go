@@ -1,6 +1,4 @@
-/*
-Copyright 2021 The Kubernetes Authors.
-
+/* Copyright 2021 The Kubernetes Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -67,6 +65,7 @@ func (s *nonBlockingGRPCServer) ForceStop() {
 }
 
 func (s *nonBlockingGRPCServer) serve(endpoint string, ids csi.IdentityServer, cs csi.ControllerServer, ns csi.NodeServer) {
+	defer s.wg.Done()
 
 	proto, addr, err := utils.ParseEndpoint(endpoint)
 	if err != nil {
@@ -102,9 +101,7 @@ func (s *nonBlockingGRPCServer) serve(endpoint string, ids csi.IdentityServer, c
 	}
 
 	klog.Infof("Listening for connections on address: %#v", listener.Addr())
-
-	err = server.Serve(listener)
-	if err != nil {
-		klog.Fatalf("Failed to server: %v", err)
+	if err := server.Serve(listener); err != nil {
+		klog.Fatalf("Failed to serve: %v", err)
 	}
 }

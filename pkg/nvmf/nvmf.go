@@ -1,6 +1,4 @@
-/*
-Copyright 2021 The Kubernetes Authors.
-
+/* Copyright 2021 The Kubernetes Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -39,16 +37,19 @@ type nvmfDiskInfo struct {
 	HostNqn   string
 }
 
+// getNVMfDiskInfo extracts NVMe-oF connection parameters from the volume context.
+// This is only used for NVMe-provisioned volumes (provisionMode: "nvme").
 func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 	volName := req.GetVolumeId()
-
 	volOpts := req.GetVolumeContext()
+
 	targetTrAddr := volOpts["targetTrAddr"]
 	targetTrPort := volOpts["targetTrPort"]
 	targetTrType := volOpts["targetTrType"]
 	devHostNqn := volOpts["hostNqn"]
 	devHostId := volOpts["hostId"]
 	deviceID := volOpts["deviceID"]
+
 	if volOpts["deviceUUID"] != "" {
 		if deviceID != "" {
 			klog.Warningf("Warning: deviceUUID is overwriting already defined deviceID, volID: %s ", volName)
@@ -61,8 +62,8 @@ func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 		}
 		deviceID = strings.Join([]string{"eui", volOpts["deviceEUI"]}, ".")
 	}
-	nqn := volOpts["nqn"]
 
+	nqn := volOpts["nqn"]
 	if targetTrAddr == "" || nqn == "" || targetTrPort == "" || targetTrType == "" || deviceID == "" {
 		return nil, fmt.Errorf("some nvme target info is missing, volID: %s ", volName)
 	}
@@ -79,31 +80,34 @@ func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 	}, nil
 }
 
+// AttachDisk handles publishing the NVMe device (raw block or formatted filesystem).
+// This function is only called for NVMe-provisioned volumes (provisionMode: "nvme").
+// NFS RWX volumes bypass this entirely (direct NFS mount in NodePublishVolume).
 func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: exec.New()}
-
 	targetPath := req.GetTargetPath()
+
 	if req.GetVolumeCapability().GetBlock() != nil {
+		// Raw block: bind-mount the device file
 		dir := filepath.Dir(targetPath)
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
 			if err := os.MkdirAll(dir, 0755); err != nil {
-				return fmt.Errorf("failed to create dir of target block file: %s, err: %v", targetPath, err.Error())
+				return fmt.Errorf("failed to create dir of target block file: %s, err: %v", targetPath, err)
 			}
 		}
 
-		// bind mount
+		// Create placeholder file if not exists
 		file, err := os.Stat(targetPath)
 		if err != nil {
 			if !os.IsNotExist(err) {
-				return fmt.Errorf("failed to stat target block file exist %s, err: %v", targetPath, err.Error())
+				return fmt.Errorf("failed to stat target block file exist %s, err: %v", targetPath, err)
 			}
-
 			newFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR, 0750)
 			if err != nil {
-				return fmt.Errorf("failed to open target block file: %s, err: %v", targetPath, err.Error())
+				return fmt.Errorf("failed to open target block file: %s, err: %v", targetPath, err)
 			}
 			if err := newFile.Close(); err != nil {
-				return fmt.Errorf("failed to close target block file: %s, err: %v", targetPath, err.Error())
+				return fmt.Errorf("failed to close target block file: %s, err: %v", targetPath, err)
 			}
 		} else {
 			if file.Mode()&os.ModeDevice == os.ModeDevice {
@@ -111,26 +115,13 @@ func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 				return nil
 			}
 		}
+
 		if err := mounter.MountSensitive(devicePath, targetPath, "", []string{"bind"}, nil); err != nil {
-			klog.Errorf("AttachDisk: failed to mount Device %s to %s, err: %v", devicePath, targetPath, err.Error())
-			return fmt.Errorf("failed to mount Device %s to %s, err: %v", devicePath, targetPath, err.Error())
+			klog.Errorf("AttachDisk: failed to mount Device %s to %s, err: %v", devicePath, targetPath, err)
+			return fmt.Errorf("failed to mount Device %s to %s, err: %v", devicePath, targetPath, err)
 		}
-
-		// symlink
-		// if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
-		// 	return fmt.Errorf("failed to remove file %s: %v", targetPath, err)
-		// }
-		// if err := os.Symlink(devicePath, targetPath); err != nil {
-		// 	klog.Errorf("AttachDisk: failed to link Device %s to %s, err: %v", devicePath, targetPath, err.Error())
-		// 	return fmt.Errorf("failed to link Device %s to %s, err: %v", devicePath, targetPath, err.Error())
-		// }
-
-		// if _, err := os.Lstat(targetPath); err != nil {
-		// 	klog.Errorf("Failed to verify symlink creation: %v", err)
-		// 	return err
-		// }
-		// klog.Infof("Successfully created symlink from %s to %s", devicePath, targetPath)
 	} else if req.GetVolumeCapability().GetMount() != nil {
+		// Filesystem mount on NVMe device
 		notMounted, err := mounter.IsLikelyNotMountPoint(targetPath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -143,7 +134,6 @@ func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 				return fmt.Errorf("check target path %v", err)
 			}
 		}
-
 		if !notMounted {
 			klog.Infof("AttachDisk: VolumeID: %s, Path: %s is already mounted.", req.GetVolumeId(), req.GetTargetPath())
 			return nil
@@ -153,7 +143,7 @@ func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 		readonly := req.GetReadonly()
 		mountOptions := req.GetVolumeCapability().GetMount().GetMountFlags()
 
-		options := []string{""}
+		options := []string{}
 		if readonly {
 			options = append(options, "ro")
 		} else {
@@ -171,10 +161,13 @@ func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 	return nil
 }
 
+// DetachDisk performs unmount and cleanup of the target path.
+// This works for both NVMe mounts and NFS mounts (generic unmount).
 func DetachDisk(targetPath string) (err error) {
 	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: exec.New()}
 
-	if notMnt, err := mount.IsNotMountPoint(mounter, targetPath); err != nil {
+	notMnt, err := mount.IsNotMountPoint(mounter, targetPath)
+	if err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("check target path error: %w", err)
 		}
@@ -183,12 +176,10 @@ func DetachDisk(targetPath string) (err error) {
 			klog.Errorf("nvmf detach disk: failed to unmount: %s\nError: %v", targetPath, err)
 			return err
 		}
-
-		// Delete the mount point
+		// Delete the mount point (safe for both block file and directory)
 		if err = os.RemoveAll(targetPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to remove target path: %w", err)
 		}
 	}
-
 	return nil
 }
