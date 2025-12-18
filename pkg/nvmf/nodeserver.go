@@ -19,6 +19,7 @@ package nvmf
 import (
 	"os"
 	"path"
+	"path/filepath"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-driver-nvmf/pkg/utils"
@@ -177,14 +178,14 @@ func (n *NodeServer) NodeUnstageVolume(_ context.Context, _ *csi.NodeUnstageVolu
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
-func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	deviceName, err := GetDeviceNameByVolumeID(req.VolumeId)
+func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	controller, _, err := getNvmeInfoByNqn(req.VolumeId)
 	if err != nil {
-		klog.Errorf("NodeExpandVolume: Get Device by volumeID: %s error %v", req.VolumeId, err)
-		return nil, status.Errorf(codes.Internal, "NodeExpandVolume: Get Device by volumeID: %s error %v", req.VolumeId, err)
+		klog.Errorf("NodeExpandVolume: failed to find controller for %s: %v", req.VolumeId, err)
+		return nil, status.Errorf(codes.Internal, "failed to find controller for volume %s: %v", req.VolumeId, err)
 	}
 
-	scanPath := parseDeviceToControllerPath(deviceName)
+	scanPath := filepath.Join("/sys/class/nvme-fabrics/ctl", controller, "rescan_controller")
 	klog.Infof("Triggering NVMe-oF controller rescan at %s for volume %s", scanPath, req.VolumeId)
 
 	if !utils.IsFileExisting(scanPath) {

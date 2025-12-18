@@ -19,6 +19,7 @@ package nvmf
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -45,21 +46,66 @@ func waitForPathToExist(devicePath string, maxRetries, intervalSeconds int, devi
 	return false, fmt.Errorf("not found devicePath %s and transport %s", devicePath, deviceTransport)
 }
 
+// getNvmeInfoByNqn discovers the controller and raw device path for a given subsystem NQN
+func getNvmeInfoByNqn(nqn string) (controller string, devicePath string, err error) {
+	const ctlPath = "/sys/class/nvme-fabrics/ctl"
+
+	entries, err := os.ReadDir(ctlPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read %s: %w", ctlPath, err)
+	}
+
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "nvme") {
+			continue
+		}
+
+		subsysPath := filepath.Join(ctlPath, entry.Name(), "subsysnqn")
+		data, err := os.ReadFile(subsysPath)
+		if err != nil {
+			continue
+		}
+
+		if strings.TrimSpace(string(data)) == nqn {
+			controller = entry.Name()
+
+			// Scan for namespace directories (e.g., nvme0c1n2)
+			nsEntries, err := os.ReadDir(filepath.Join(ctlPath, entry.Name()))
+			if err != nil {
+				return controller, "", err
+			}
+
+			for _, ns := range nsEntries {
+				nsName := ns.Name()
+				if strings.HasPrefix(nsName, "nvme") && strings.Contains(nsName, "n") {
+					// Clean namespace name (remove 'c' part, e.g., nvme0c1n2 → nvme0n2)
+					cleanNs := strings.Replace(nsName, "c", "", -1)
+					return controller, "/dev/" + cleanNs, nil
+				}
+			}
+
+			return controller, "", fmt.Errorf("no namespace found under controller %s for NQN %s", controller, nqn)
+		}
+	}
+
+	return "", "", fmt.Errorf("no controller found for NQN %s", nqn)
+}
+
 func GetDeviceNameByVolumeID(volumeID string) (string, error) {
-	// Use NQN-based discovery (volumeID == NQN in your setup)
-	devicePath, err := getDevicePathByNqn(volumeID)
+	_, devicePath, err := getNvmeInfoByNqn(volumeID)
 	if err != nil {
 		return "", fmt.Errorf("failed to find device for volumeID %s: %w", volumeID, err)
 	}
 	return devicePath, nil
 }
 
-func parseDeviceToControllerPath(deviceName string) string {
-	nvmfControllerPrefix := "/sys/class/block"
-	index := strings.LastIndex(deviceName, "n")
-	parsed := deviceName[:index] + "c0" + deviceName[index:]
-	scanPath := filepath.Join(nvmfControllerPrefix, parsed, "device/rescan_controller")
-	return scanPath
+// parseDeviceToControllerPath returns the correct rescan path for NVMe-oF fabrics controllers
+func parseDeviceToControllerPath(volumeID string) (string, error) {
+	controller, _, err := getNvmeInfoByNqn(volumeID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join("/sys/class/nvme-fabrics/ctl", controller, "rescan_controller"), nil
 }
 
 func logGRPC(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
@@ -75,7 +121,6 @@ func logGRPC(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, h
 }
 
 func Rollback(err error, fc func()) {
-
 	if err != nil {
 		if fc != nil {
 			klog.Infof("Executing rollback func:%s for error: %v", runtime.FuncForPC(reflect.ValueOf(fc).Pointer()).Name(), err)
