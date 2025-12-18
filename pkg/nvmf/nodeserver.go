@@ -20,6 +20,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-driver-nvmf/pkg/utils"
@@ -56,37 +57,24 @@ func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabi
 }
 
 func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	// Pre-check
+	// Pre-checks
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing Volume Capability in req.")
 	}
-
 	if len(req.GetVolumeId()) == 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing VolumeID in req.")
 	}
-
 	if len(req.GetTargetPath()) == 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing TargetPath in req.")
 	}
 
 	klog.Infof("VolumeID %s publish to targetPath %s.", req.GetVolumeId(), req.GetTargetPath())
 
-	// Force cleanup of any existing connection/persistence for this volume
-	connectorFilePath := path.Join(DefaultVolumeMapPath, req.GetVolumeId()+".json")
-	if _, err := os.Stat(connectorFilePath); err == nil {
-		if connector, loadErr := GetConnectorFromFile(connectorFilePath); loadErr == nil {
-			klog.Infof("Force disconnecting existing connection for volume %s before new publish", req.VolumeId)
-			_ = connector.Disconnect()
-		}
-		removeConnectorFile(connectorFilePath)
-	}
-
-	// Connect remote disk (always fresh connect - no idempotent skip)
+	// Connect remote disk (idempotent if already connected with same parameters)
 	nvmfInfo, err := getNVMfDiskInfo(req)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "NodePublishVolume: get NVMf disk info from req err: %v", err)
 	}
-
 	connector := getNvmfConnector(nvmfInfo)
 	devicePath, err := connector.Connect()
 	if err != nil {
@@ -99,7 +87,8 @@ func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVo
 	}
 	klog.Infof("Volume %s successful connected, Device: %s", req.VolumeId, devicePath)
 
-	// Persist new connector
+	// Persist new/updated connector (overwrites if exists)
+	connectorFilePath := path.Join(DefaultVolumeMapPath, req.GetVolumeId()+".json")
 	err = persistConnectorFile(connector, connectorFilePath)
 	if err != nil {
 		klog.Errorf("failed to persist connection info: %v", err)
@@ -109,7 +98,7 @@ func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVo
 		return nil, status.Errorf(codes.Internal, "VolumeID %s persist connection info error: %v", req.VolumeId, err)
 	}
 
-	// Attach disk to container path
+	// Validate access type
 	if req.GetVolumeCapability().GetBlock() != nil && req.GetVolumeCapability().GetMount() != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "cannot have both block and mount access type")
 	}
@@ -180,30 +169,52 @@ func (n *NodeServer) NodeUnstageVolume(_ context.Context, _ *csi.NodeUnstageVolu
 }
 
 func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	controller, devicePath, err := getNvmeInfoByNqn(req.VolumeId)
-	if err != nil {
-		klog.Errorf("NodeExpandVolume: failed to find device/controller for %s: %v", req.VolumeId, err)
+	if len(req.GetVolumeId()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	}
+
+	// Get the (now correctly parsed) device path
+	_, devicePath, err := getNvmeInfoByNqn(req.VolumeId)
+	if err != nil || devicePath == "" {
+		klog.Errorf("NodeExpandVolume: failed to find device for %s: %v", req.VolumeId, err)
 		return nil, status.Errorf(codes.Internal, "failed to find device for volume %s: %v", req.VolumeId, err)
 	}
 
-	// Trigger rescan
-	scanPath := filepath.Join("/sys/class/nvme-fabrics/ctl", controller, "rescan_controller")
-	klog.Infof("Triggering NVMe-oF controller rescan at %s for volume %s", scanPath, req.VolumeId)
-
-	if utils.IsFileExisting(scanPath) {
-		file, err := os.OpenFile(scanPath, os.O_WRONLY, 0666)
-		if err != nil {
-			klog.Errorf("Failed to open rescan path %s: %v", scanPath, err)
-		} else {
-			defer file.Close()
-			if _, err = file.WriteString("1"); err != nil {
-				klog.Errorf("Failed to trigger rescan: %v", err)
-			} else {
-				klog.Infof("Successfully triggered rescan for controller %s", controller)
+	// Rescan ALL controllers matching the NQN (robust for single-path, future-proof for multi-path)
+	const ctlPath = "/sys/class/nvme-fabrics/ctl"
+	entries, err := os.ReadDir(ctlPath)
+	if err != nil {
+		klog.Errorf("NodeExpandVolume: failed to read %s: %v", ctlPath, err)
+	} else {
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), "nvme") {
+				continue
+			}
+			subsysPath := filepath.Join(ctlPath, entry.Name(), "subsysnqn")
+			data, err := os.ReadFile(subsysPath)
+			if err != nil {
+				continue
+			}
+			if strings.TrimSpace(string(data)) == req.VolumeId {
+				scanPath := filepath.Join(ctlPath, entry.Name(), "rescan_controller")
+				klog.Infof("Triggering NVMe-oF controller rescan at %s for volume %s", scanPath, req.VolumeId)
+				if utils.IsFileExisting(scanPath) {
+					file, err := os.OpenFile(scanPath, os.O_WRONLY, 0666)
+					if err != nil {
+						klog.Errorf("Failed to open rescan path %s: %v", scanPath, err)
+					} else {
+						defer file.Close()
+						if _, err = file.WriteString("1"); err != nil {
+							klog.Errorf("Failed to trigger rescan on %s: %v", entry.Name(), err)
+						} else {
+							klog.Infof("Successfully triggered rescan for controller %s", entry.Name())
+						}
+					}
+				} else {
+					klog.Warningf("Rescan path %s not found — skipping", scanPath)
+				}
 			}
 		}
-	} else {
-		klog.Warningf("Rescan path %s not found — skipping (size may already be updated)", scanPath)
 	}
 
 	// Online filesystem resize (ext4)

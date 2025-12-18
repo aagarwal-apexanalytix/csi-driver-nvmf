@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,7 +50,6 @@ func waitForPathToExist(devicePath string, maxRetries, intervalSeconds int, devi
 // getNvmeInfoByNqn discovers the controller and raw device path for a given subsystem NQN
 func getNvmeInfoByNqn(nqn string) (controller string, devicePath string, err error) {
 	const ctlPath = "/sys/class/nvme-fabrics/ctl"
-
 	entries, err := os.ReadDir(ctlPath)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to read %s: %w", ctlPath, err)
@@ -59,35 +59,46 @@ func getNvmeInfoByNqn(nqn string) (controller string, devicePath string, err err
 		if !strings.HasPrefix(entry.Name(), "nvme") {
 			continue
 		}
-
 		subsysPath := filepath.Join(ctlPath, entry.Name(), "subsysnqn")
 		data, err := os.ReadFile(subsysPath)
 		if err != nil {
 			continue
 		}
-
 		if strings.TrimSpace(string(data)) == nqn {
 			controller = entry.Name()
+			subsysStr := strings.TrimPrefix(controller, "nvme")
 
-			// Scan for namespace directories (e.g., nvme0c1n2)
-			nsEntries, err := os.ReadDir(filepath.Join(ctlPath, entry.Name()))
+			// Find namespaces under this controller
+			nsDir := filepath.Join(ctlPath, entry.Name())
+			nsEntries, err := os.ReadDir(nsDir)
 			if err != nil {
 				return controller, "", err
 			}
 
-			for _, ns := range nsEntries {
-				nsName := ns.Name()
-				if strings.HasPrefix(nsName, "nvme") && strings.Contains(nsName, "n") {
-					// Clean namespace name (remove 'c' part, e.g., nvme0c1n2 → nvme0n2)
-					cleanNs := strings.Replace(nsName, "c", "", -1)
-					return controller, "/dev/" + cleanNs, nil
+			for _, nsEntry := range nsEntries {
+				nsName := nsEntry.Name()
+				if !strings.HasPrefix(nsName, "nvme") || !strings.Contains(nsName, "n") {
+					continue
 				}
-			}
 
+				// Extract namespace ID: everything after the last "n"
+				lastNIdx := strings.LastIndex(nsName, "n")
+				if lastNIdx == -1 || lastNIdx+1 >= len(nsName) {
+					continue
+				}
+				nsStr := nsName[lastNIdx+1:]
+
+				// Safety: ensure it's numeric
+				if _, err := strconv.Atoi(nsStr); err != nil {
+					continue
+				}
+
+				devicePath = "/dev/nvme" + subsysStr + "n" + nsStr
+				return controller, devicePath, nil
+			}
 			return controller, "", fmt.Errorf("no namespace found under controller %s for NQN %s", controller, nqn)
 		}
 	}
-
 	return "", "", fmt.Errorf("no controller found for NQN %s", nqn)
 }
 
