@@ -68,7 +68,18 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	}
 
 	klog.Infof("VolumeID %s publish to targetPath %s.", req.GetVolumeId(), req.GetTargetPath())
-	// Connect remote disk
+
+	// Force cleanup of any existing connection/persistence for this volume
+	connectorFilePath := path.Join(DefaultVolumeMapPath, req.GetVolumeId()+".json")
+	if _, err := os.Stat(connectorFilePath); err == nil {
+		if connector, loadErr := GetConnectorFromFile(connectorFilePath); loadErr == nil {
+			klog.Infof("Force disconnecting existing connection for volume %s before new publish", req.VolumeId)
+			connector.Disconnect()
+		}
+		removeConnectorFile(connectorFilePath)
+	}
+
+	// Connect remote disk (always fresh connect - no idempotent skip)
 	nvmfInfo, err := getNVMfDiskInfo(req)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "NodePublishVolume: get NVMf disk info from req err: %v", err)
@@ -76,9 +87,6 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 
 	connector := getNvmfConnector(nvmfInfo)
 	devicePath, err := connector.Connect()
-
-	connectorFilePath := path.Join(DefaultVolumeMapPath, req.GetVolumeId()+".json")
-
 	if err != nil {
 		klog.Errorf("VolumeID %s failed to connect, Error: %v", req.VolumeId, err)
 		return nil, status.Errorf(codes.Internal, "VolumeID %s failed to connect, Error: %v", req.VolumeId, err)
@@ -87,14 +95,15 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 		klog.Errorf("VolumeID %s connected, but return nil devicePath", req.VolumeId)
 		return nil, status.Errorf(codes.Internal, "VolumeID %s connected, but return nil devicePath", req.VolumeId)
 	}
-	klog.Infof("Volume %s successful connected, Device：%s", req.VolumeId, devicePath)
-	defer Rollback(err, func() {
-		connector.Disconnect()
-	})
+	klog.Infof("Volume %s successful connected, Device: %s", req.VolumeId, devicePath)
 
+	// Persist new connector
 	err = persistConnectorFile(connector, connectorFilePath)
 	if err != nil {
 		klog.Errorf("failed to persist connection info: %v", err)
+		// Rollback connect
+		connector.Disconnect()
+		removeConnectorFile(connectorFilePath)
 		return nil, status.Errorf(codes.Internal, "VolumeID %s persist connection info error: %v", req.VolumeId, err)
 	}
 
@@ -102,12 +111,12 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	if req.GetVolumeCapability().GetBlock() != nil && req.GetVolumeCapability().GetMount() != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "cannot have both block and mount access type")
 	}
-	defer Rollback(err, func() {
-		removeConnectorFile(connectorFilePath)
-	})
 
 	err = AttachDisk(req, devicePath)
 	if err != nil {
+		// Rollback on attach failure
+		connector.Disconnect()
+		removeConnectorFile(connectorFilePath)
 		return nil, status.Errorf(codes.Internal, "VolumeID %s attach error: %v", req.VolumeId, err)
 	}
 
