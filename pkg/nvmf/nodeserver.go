@@ -122,10 +122,10 @@ func (n *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 		return nil, status.Error(codes.InvalidArgument, "NodeUnpublishVolume VolumeID must be provided")
 	}
 	if req.TargetPath == "" {
-		return nil, status.Error(codes.InvalidArgument, "NodeUnpublishVolume Staging TargetPath must be provided")
+		return nil, status.Error(codes.InvalidArgument, "NodeUnpublishVolume TargetPath must be provided")
 	}
 
-	// Detach disk
+	// Detach disk (unmount)
 	targetPath := req.GetTargetPath()
 	err := DetachDisk(targetPath)
 	if err != nil {
@@ -133,20 +133,30 @@ func (n *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 		return nil, err
 	}
 
-	// Disconnect remote disk
+	// Force disconnect the NVMe-oF subsystem to reset kernel state
+	// First try from persistence file
 	connectorFilePath := path.Join(DefaultVolumeMapPath, req.GetVolumeId()+".json")
-	connector, err := GetConnectorFromFile(connectorFilePath)
-	if err != nil {
-		klog.Errorf("failed to get connector from path %s Error: %v", targetPath, err)
-		return nil, status.Errorf(codes.Internal, "failed to get connector from path %s Error: %v", targetPath, err)
+	var nqn string
+	if connector, loadErr := GetConnectorFromFile(connectorFilePath); loadErr == nil {
+		nqn = connector.TargetNqn
+		_ = connector.Disconnect()
+	} else {
+		// Fallback: assume NQN == VolumeID
+		nqn = req.VolumeId
 	}
-	err = connector.Disconnect()
-	if err != nil {
-		klog.Errorf("VolumeID: %s failed to disconnect, Error: %v", targetPath, err)
-		return nil, status.Errorf(codes.Internal, "failed to get connector from path %s Error: %v", targetPath, err)
+
+	// Force disconnect by NQN (ignores hostnqn for broad cleanup)
+	ret := disconnectByNqn(nqn, "")
+	if ret > 0 {
+		klog.Infof("Forced disconnect of %d controllers for NQN %s", ret, nqn)
+	} else if ret < 0 {
+		klog.Warningf("Force disconnect failed for NQN %s", nqn)
 	}
+
+	// Clean persistence
 	removeConnectorFile(connectorFilePath)
 
+	klog.Infof("NodeUnpublishVolume completed for volume %s", req.VolumeId)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
