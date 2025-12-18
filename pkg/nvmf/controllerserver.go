@@ -605,9 +605,21 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *c
 	for _, cap := range req.VolumeCapabilities {
 		if cap.GetBlock() == nil && cap.GetMount() == nil {
 			supported = false
+			continue
 		}
-		if mode := cap.GetAccessMode(); mode != nil && mode.GetMode() != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER {
-			supported = false
+
+		mode := cap.GetAccessMode().GetMode()
+		if cap.GetBlock() != nil {
+			// Allow RWO and RWX for raw block (needed for KubeVirt migration)
+			if mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER &&
+				mode != csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER {
+				supported = false
+			}
+		} else {
+			// For mount (filesystem) volumes, only allow single-node writer
+			if mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER {
+				supported = false
+			}
 		}
 	}
 

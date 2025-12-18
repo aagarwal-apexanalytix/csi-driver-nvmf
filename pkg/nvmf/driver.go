@@ -60,6 +60,7 @@ func (d *driver) Run(conf *GlobalConfig) {
 	d.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{})
 	d.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 	})
 
 	d.idServer = NewIdentityServer(d)
