@@ -38,7 +38,7 @@ func NewNodeServer(d *driver) *NodeServer {
 	}
 }
 
-func (n *NodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	klog.Infof("Using Nvme NodeGetCapabilities")
 	return &csi.NodeGetCapabilitiesResponse{
 		Capabilities: []*csi.NodeServiceCapability{
@@ -53,7 +53,7 @@ func (n *NodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCa
 	}, nil
 }
 
-func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	// Pre-check
 	if req.GetVolumeCapability() == nil {
 		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing Volume Capability in req.")
@@ -74,7 +74,7 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	if _, err := os.Stat(connectorFilePath); err == nil {
 		if connector, loadErr := GetConnectorFromFile(connectorFilePath); loadErr == nil {
 			klog.Infof("Force disconnecting existing connection for volume %s before new publish", req.VolumeId)
-			connector.Disconnect()
+			_ = connector.Disconnect()
 		}
 		removeConnectorFile(connectorFilePath)
 	}
@@ -102,7 +102,7 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	if err != nil {
 		klog.Errorf("failed to persist connection info: %v", err)
 		// Rollback connect
-		connector.Disconnect()
+		_ = connector.Disconnect()
 		removeConnectorFile(connectorFilePath)
 		return nil, status.Errorf(codes.Internal, "VolumeID %s persist connection info error: %v", req.VolumeId, err)
 	}
@@ -115,7 +115,7 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	err = AttachDisk(req, devicePath)
 	if err != nil {
 		// Rollback on attach failure
-		connector.Disconnect()
+		_ = connector.Disconnect()
 		removeConnectorFile(connectorFilePath)
 		return nil, status.Errorf(codes.Internal, "VolumeID %s attach error: %v", req.VolumeId, err)
 	}
@@ -123,7 +123,7 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (n *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+func (n *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	klog.Infof("NodeUnpublishVolume: Starting unpublish volume, %s, %v", req.VolumeId, req)
 
 	// Pre-check
@@ -169,15 +169,15 @@ func (n *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-func (n *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+func (n *NodeServer) NodeStageVolume(_ context.Context, _ *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-func (n *NodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+func (n *NodeServer) NodeUnstageVolume(_ context.Context, _ *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
-func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	deviceName, err := GetDeviceNameByVolumeID(req.VolumeId)
 	if err != nil {
 		klog.Errorf("NodeExpandVolume: Get Device by volumeID: %s error %v", req.VolumeId, err)
@@ -203,12 +203,12 @@ func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 	return &csi.NodeExpandVolumeResponse{}, nil
 }
 
-func (n *NodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+func (n *NodeServer) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	return &csi.NodeGetInfoResponse{
 		NodeId: n.Driver.nodeId,
 	}, nil
 }
 
-func (n *NodeServer) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+func (n *NodeServer) NodeGetVolumeStats(_ context.Context, _ *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "NodeGetVolumeStats not implement")
 }

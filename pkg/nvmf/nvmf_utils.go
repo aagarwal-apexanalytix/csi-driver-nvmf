@@ -19,7 +19,6 @@ package nvmf
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -46,32 +45,13 @@ func waitForPathToExist(devicePath string, maxRetries, intervalSeconds int, devi
 	return false, fmt.Errorf("not found devicePath %s and transport %s", devicePath, deviceTransport)
 }
 
-func GetDeviceNameByVolumeID(volumeID string) (deviceName string, err error) {
-	volumeLinkPath := strings.Join([]string{"/dev/disk/by-id/nvme-uuid", volumeID}, ".")
-	stat, err := os.Lstat(volumeLinkPath)
+func GetDeviceNameByVolumeID(volumeID string) (string, error) {
+	// Use NQN-based discovery (volumeID == NQN in your setup)
+	devicePath, err := getDevicePathByNqn(volumeID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("volumeID link path %q not found", volumeLinkPath)
-		} else {
-			return "", fmt.Errorf("error getting stat of %q: %v", volumeLinkPath, err)
-		}
+		return "", fmt.Errorf("failed to find device for volumeID %s: %w", volumeID, err)
 	}
-
-	if stat.Mode()&os.ModeSymlink != os.ModeSymlink {
-		klog.Errorf("volumeID link file %q found, but was not a symlink", volumeLinkPath)
-		return "", fmt.Errorf("volumeID link file %q found, but was not a symlink", volumeLinkPath)
-	}
-
-	resolved, err := filepath.EvalSymlinks(volumeLinkPath)
-	if err != nil {
-		return "", fmt.Errorf("error reading target of symlink %q: %v", volumeLinkPath, err)
-	}
-	if !strings.HasPrefix(resolved, "/dev") {
-		return "", fmt.Errorf("resolved symlink for %q was unexpected: %q", volumeLinkPath, resolved)
-	}
-	klog.Infof("Device Link Info: %s link to %s", volumeLinkPath, resolved)
-	tmp := strings.Split(resolved, "/")
-	return tmp[len(tmp)-1], nil
+	return devicePath, nil
 }
 
 func parseDeviceToControllerPath(deviceName string) string {
