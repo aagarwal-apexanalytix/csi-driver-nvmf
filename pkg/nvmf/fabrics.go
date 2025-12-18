@@ -266,12 +266,10 @@ func getDevicePathByNqn(nqn string) (string, error) {
 		subsysPath := filepath.Join(sysNvmeFabricsPath, entry.Name(), "subsysnqn")
 		data, err := os.ReadFile(subsysPath)
 		if err != nil {
-			// Skip unreadable entries
-			continue
+			continue // Skip unreadable
 		}
 
 		if strings.TrimSpace(string(data)) == nqn {
-			// Standard namespace 1 for single-namespace volumes
 			return "/dev/" + entry.Name() + "n1", nil
 		}
 	}
@@ -279,7 +277,6 @@ func getDevicePathByNqn(nqn string) (string, error) {
 	return "", fmt.Errorf("no NVMe device found for subsystem NQN %s", nqn)
 }
 
-// Connect to volume to this node and return devicePath
 func (c *Connector) Connect() (string, error) {
 	if c.RetryCount == 0 {
 		c.RetryCount = 10
@@ -307,25 +304,56 @@ func (c *Connector) Connect() (string, error) {
 	}
 	baseString := builder.String()
 
-	// Perform the NVMe-oF connect
+	// Check if already connected (idempotent)
+	if devicePath, err := getDevicePathByNqn(c.TargetNqn); err == nil {
+		klog.Infof("Volume %s already connected at %s (idempotent connect)", c.VolumeID, devicePath)
+
+		// Ensure persistence directory and hostnqn file exist
+		nqnPath := filepath.Join(RUN_NVMF, c.TargetNqn)
+		if err := os.MkdirAll(nqnPath, 0750); err != nil && !os.IsExist(err) {
+			klog.Warningf("Failed to create nqn directory %s: %v", nqnPath, err)
+		}
+
+		if c.HostNqn != "" {
+			hostnqnPath := filepath.Join(nqnPath, b64.StdEncoding.EncodeToString([]byte(c.HostNqn)))
+			if _, err := os.Stat(hostnqnPath); os.IsNotExist(err) {
+				if file, createErr := os.Create(hostnqnPath); createErr == nil {
+					file.Close()
+				}
+			}
+		}
+
+		return devicePath, nil
+	}
+
+	// Not connected — perform connect
 	err := _connect(baseString)
 	if err != nil {
-		return "", err
-	}
-	klog.Infof("Connect Volume %s success nqn: %s, hostnqn: %s", c.VolumeID, c.TargetNqn, c.HostNqn)
-
-	// Discover the raw device path (/dev/nvmeXn1) by matching subsystem NQN in sysfs
-	devicePath, err := getDevicePathByNqn(c.TargetNqn)
-	if err != nil {
-		klog.Errorf("Failed to discover device for nqn %s: %v, initiating rollback", c.TargetNqn, err)
-		ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
-		if ret < 0 {
-			klog.Errorf("Rollback disconnect failed for nqn %s", c.TargetNqn)
+		if strings.Contains(err.Error(), "operation already in progress") {
+			klog.Infof("Connect reported 'already in progress' for %s — retrying discovery", c.VolumeID)
+			time.Sleep(2 * time.Second)
+			if devicePath, retryErr := getDevicePathByNqn(c.TargetNqn); retryErr == nil {
+				klog.Infof("Recovered existing connection for %s at %s", c.VolumeID, devicePath)
+				return devicePath, nil
+			}
 		}
 		return "", err
 	}
 
-	// Short wait loop in case the device node appears slightly delayed
+	klog.Infof("Connect Volume %s success nqn: %s, hostnqn: %s", c.VolumeID, c.TargetNqn, c.HostNqn)
+
+	// Discover device path
+	devicePath, err := getDevicePathByNqn(c.TargetNqn)
+	if err != nil {
+		klog.Errorf("Failed to discover device after connect for nqn %s: %v — rollback", c.TargetNqn, err)
+		ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
+		if ret < 0 {
+			klog.Errorf("Rollback disconnect failed")
+		}
+		return "", err
+	}
+
+	// Short wait if device node delayed
 	for i := 0; i < 10; i++ {
 		if _, statErr := os.Stat(devicePath); statErr == nil {
 			break
@@ -334,40 +362,40 @@ func (c *Connector) Connect() (string, error) {
 	}
 
 	if _, statErr := os.Stat(devicePath); statErr != nil {
-		klog.Errorf("Device %s still not present after wait: %v, rollback", devicePath, statErr)
+		klog.Errorf("Device %s not present after wait: %v — rollback", devicePath, statErr)
 		ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
 		if ret < 0 {
-			klog.Errorf("Rollback disconnect failed")
+			klog.Errorf("Rollback failed")
 		}
-		return "", fmt.Errorf("device %s did not appear after connect", devicePath)
+		return "", fmt.Errorf("device %s did not appear", devicePath)
 	}
 
-	// Create persistence directory and hostnqn file (existing logic preserved)
+	// Persistence
 	nqnPath := filepath.Join(RUN_NVMF, c.TargetNqn)
 	if err := os.MkdirAll(nqnPath, 0750); err != nil {
-		klog.Errorf("create nqn directory %s error %v, rollback!!!", c.TargetNqn, err)
+		klog.Errorf("create nqn directory %s error %v — rollback", c.TargetNqn, err)
 		ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
 		if ret < 0 {
-			klog.Errorf("rollback error !!!")
+			klog.Errorf("rollback error")
 		}
 		return "", err
 	}
 
 	if c.HostNqn != "" {
-		hostnqnPath := filepath.Join(RUN_NVMF, c.TargetNqn, b64.StdEncoding.EncodeToString([]byte(c.HostNqn)))
+		hostnqnPath := filepath.Join(nqnPath, b64.StdEncoding.EncodeToString([]byte(c.HostNqn)))
 		file, err := os.Create(hostnqnPath)
 		if err != nil {
-			klog.Errorf("create hostnqn file %s:%s error %v, rollback!!!", c.TargetNqn, c.HostNqn, err)
+			klog.Errorf("create hostnqn file %s error %v — rollback", hostnqnPath, err)
 			ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
 			if ret < 0 {
-				klog.Errorf("rollback error !!!")
+				klog.Errorf("rollback error")
 			}
 			return "", err
 		}
 		file.Close()
 	}
 
-	klog.Infof("After connect we're returning devicePath: %s", devicePath)
+	klog.Infof("After connect returning devicePath: %s", devicePath)
 	return devicePath, nil
 }
 
