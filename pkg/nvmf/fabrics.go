@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kubernetes-csi/csi-driver-nvmf/pkg/utils"
 	"k8s.io/klog/v2"
@@ -249,7 +250,36 @@ func disconnectByNqn(nqn, hostnqn string) int {
 	return ret
 }
 
-// connect to volume to this node and return devicePath
+func getDevicePathByNqn(nqn string) (string, error) {
+	const sysNvmeFabricsPath = "/sys/class/nvme-fabrics/ctl"
+
+	entries, err := os.ReadDir(sysNvmeFabricsPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read %s: %w", sysNvmeFabricsPath, err)
+	}
+
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "nvme") {
+			continue
+		}
+
+		subsysPath := filepath.Join(sysNvmeFabricsPath, entry.Name(), "subsysnqn")
+		data, err := os.ReadFile(subsysPath)
+		if err != nil {
+			// Skip unreadable entries
+			continue
+		}
+
+		if strings.TrimSpace(string(data)) == nqn {
+			// Standard namespace 1 for single-namespace volumes
+			return "/dev/" + entry.Name() + "n1", nil
+		}
+	}
+
+	return "", fmt.Errorf("no NVMe device found for subsystem NQN %s", nqn)
+}
+
+// Connect to volume to this node and return devicePath
 func (c *Connector) Connect() (string, error) {
 	if c.RetryCount == 0 {
 		c.RetryCount = 10
@@ -259,12 +289,11 @@ func (c *Connector) Connect() (string, error) {
 	}
 
 	if c.RetryCount < 0 || c.CheckInterval < 0 {
-		return "", fmt.Errorf("invalid RetryCount and CheckInterval combinaitons "+
-			"RetryCount: %d, CheckInterval: %d ", c.RetryCount, c.CheckInterval)
+		return "", fmt.Errorf("invalid RetryCount and CheckInterval combination: RetryCount=%d, CheckInterval=%d", c.RetryCount, c.CheckInterval)
 	}
 
 	if strings.ToLower(c.Transport) != "tcp" && strings.ToLower(c.Transport) != "rdma" {
-		return "", fmt.Errorf("csi transport only support tcp/rdma ")
+		return "", fmt.Errorf("csi transport only supports tcp/rdma")
 	}
 
 	var builder strings.Builder
@@ -278,25 +307,42 @@ func (c *Connector) Connect() (string, error) {
 	}
 	baseString := builder.String()
 
-	devicePath := strings.Join([]string{"/dev/disk/by-id/nvme-", c.DeviceID}, "")
-
-	// connect to nvmf disk
+	// Perform the NVMe-oF connect
 	err := _connect(baseString)
 	if err != nil {
 		return "", err
 	}
 	klog.Infof("Connect Volume %s success nqn: %s, hostnqn: %s", c.VolumeID, c.TargetNqn, c.HostNqn)
-	retries := int(c.RetryCount / c.CheckInterval)
-	if exists, err := waitForPathToExist(devicePath, retries, int(c.CheckInterval), c.Transport); !exists {
-		klog.Errorf("connect nqn %s error %v, rollback!!!", c.TargetNqn, err)
+
+	// Discover the raw device path (/dev/nvmeXn1) by matching subsystem NQN in sysfs
+	devicePath, err := getDevicePathByNqn(c.TargetNqn)
+	if err != nil {
+		klog.Errorf("Failed to discover device for nqn %s: %v, initiating rollback", c.TargetNqn, err)
 		ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
 		if ret < 0 {
-			klog.Errorf("rollback error !!!")
+			klog.Errorf("Rollback disconnect failed for nqn %s", c.TargetNqn)
 		}
 		return "", err
 	}
 
-	// create nqn directory
+	// Short wait loop in case the device node appears slightly delayed
+	for i := 0; i < 10; i++ {
+		if _, statErr := os.Stat(devicePath); statErr == nil {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	if _, statErr := os.Stat(devicePath); statErr != nil {
+		klog.Errorf("Device %s still not present after wait: %v, rollback", devicePath, statErr)
+		ret := disconnectByNqn(c.TargetNqn, c.HostNqn)
+		if ret < 0 {
+			klog.Errorf("Rollback disconnect failed")
+		}
+		return "", fmt.Errorf("device %s did not appear after connect", devicePath)
+	}
+
+	// Create persistence directory and hostnqn file (existing logic preserved)
 	nqnPath := filepath.Join(RUN_NVMF, c.TargetNqn)
 	if err := os.MkdirAll(nqnPath, 0750); err != nil {
 		klog.Errorf("create nqn directory %s error %v, rollback!!!", c.TargetNqn, err)
@@ -307,7 +353,6 @@ func (c *Connector) Connect() (string, error) {
 		return "", err
 	}
 
-	// create hostnqn file
 	if c.HostNqn != "" {
 		hostnqnPath := filepath.Join(RUN_NVMF, c.TargetNqn, b64.StdEncoding.EncodeToString([]byte(c.HostNqn)))
 		file, err := os.Create(hostnqnPath)
@@ -319,7 +364,7 @@ func (c *Connector) Connect() (string, error) {
 			}
 			return "", err
 		}
-		defer file.Close()
+		file.Close()
 	}
 
 	klog.Infof("After connect we're returning devicePath: %s", devicePath)
