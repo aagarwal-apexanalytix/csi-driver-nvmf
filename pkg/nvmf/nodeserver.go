@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/exec"
 )
 
 type NodeServer struct {
@@ -179,33 +180,44 @@ func (n *NodeServer) NodeUnstageVolume(_ context.Context, _ *csi.NodeUnstageVolu
 }
 
 func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	controller, _, err := getNvmeInfoByNqn(req.VolumeId)
+	controller, devicePath, err := getNvmeInfoByNqn(req.VolumeId)
 	if err != nil {
-		klog.Errorf("NodeExpandVolume: failed to find controller for %s: %v", req.VolumeId, err)
-		return nil, status.Errorf(codes.Internal, "failed to find controller for volume %s: %v", req.VolumeId, err)
+		klog.Errorf("NodeExpandVolume: failed to find device/controller for %s: %v", req.VolumeId, err)
+		return nil, status.Errorf(codes.Internal, "failed to find device for volume %s: %v", req.VolumeId, err)
 	}
 
+	// Trigger rescan
 	scanPath := filepath.Join("/sys/class/nvme-fabrics/ctl", controller, "rescan_controller")
 	klog.Infof("Triggering NVMe-oF controller rescan at %s for volume %s", scanPath, req.VolumeId)
 
-	if !utils.IsFileExisting(scanPath) {
-		return nil, status.Errorf(codes.Internal, "NodeExpandVolume: rescan path %s not exist", scanPath)
+	if utils.IsFileExisting(scanPath) {
+		file, err := os.OpenFile(scanPath, os.O_WRONLY, 0666)
+		if err != nil {
+			klog.Errorf("Failed to open rescan path %s: %v", scanPath, err)
+		} else {
+			defer file.Close()
+			if _, err = file.WriteString("1"); err != nil {
+				klog.Errorf("Failed to trigger rescan: %v", err)
+			} else {
+				klog.Infof("Successfully triggered rescan for controller %s", controller)
+			}
+		}
+	} else {
+		klog.Warningf("Rescan path %s not found — skipping (size may already be updated)", scanPath)
 	}
 
-	file, err := os.OpenFile(scanPath, os.O_WRONLY, 0666)
+	// Online filesystem resize (ext4)
+	klog.Infof("Running online resize2fs on %s for volume %s", devicePath, req.VolumeId)
+	out, err := exec.New().Command("resize2fs", devicePath).CombinedOutput()
 	if err != nil {
-		klog.Errorf("NodeExpandVolume: open scan path %s error: %v", scanPath, err)
-		return nil, status.Errorf(codes.Internal, "NodeExpandVolume: open scan path %s error: %v", scanPath, err)
+		klog.Errorf("resize2fs failed for %s: %v\nOutput: %s", devicePath, err, string(out))
+		return nil, status.Errorf(codes.Internal, "filesystem resize failed: %v\nOutput: %s", err, string(out))
 	}
-	defer file.Close()
+	klog.Infof("resize2fs success: %s", string(out))
 
-	if _, err = file.WriteString("1"); err != nil {
-		klog.Errorf("NodeExpandVolume: Rescan write error: %v", err)
-		return nil, status.Errorf(codes.Internal, "NodeExpandVolume: Rescan write error: %v", err)
-	}
-
-	klog.Infof("Successfully triggered controller rescan for volume %s", req.VolumeId)
-	return &csi.NodeExpandVolumeResponse{}, nil
+	return &csi.NodeExpandVolumeResponse{
+		CapacityBytes: req.CapacityRange.GetRequiredBytes(),
+	}, nil
 }
 
 func (n *NodeServer) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
