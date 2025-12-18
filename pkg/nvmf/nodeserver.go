@@ -126,7 +126,7 @@ func (n *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubli
 		return nil, status.Error(codes.InvalidArgument, "NodeUnpublishVolume TargetPath must be provided")
 	}
 
-	// Detach disk (unmount)
+	// Detach disk (unmount only)
 	targetPath := req.GetTargetPath()
 	err := DetachDisk(targetPath)
 	if err != nil {
@@ -134,30 +134,7 @@ func (n *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubli
 		return nil, err
 	}
 
-	// Force disconnect the NVMe-oF subsystem to reset kernel state
-	// First try from persistence file
-	connectorFilePath := path.Join(DefaultVolumeMapPath, req.GetVolumeId()+".json")
-	var nqn string
-	if connector, loadErr := GetConnectorFromFile(connectorFilePath); loadErr == nil {
-		nqn = connector.TargetNqn
-		_ = connector.Disconnect()
-	} else {
-		// Fallback: assume NQN == VolumeID
-		nqn = req.VolumeId
-	}
-
-	// Force disconnect by NQN (ignores hostnqn for broad cleanup)
-	ret := disconnectByNqn(nqn, "")
-	if ret > 0 {
-		klog.Infof("Forced disconnect of %d controllers for NQN %s", ret, nqn)
-	} else if ret < 0 {
-		klog.Warningf("Force disconnect failed for NQN %s", nqn)
-	}
-
-	// Clean persistence
-	removeConnectorFile(connectorFilePath)
-
-	klog.Infof("NodeUnpublishVolume completed for volume %s", req.VolumeId)
+	klog.Infof("NodeUnpublishVolume completed for volume %s (connection and persistence preserved)", req.VolumeId)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
