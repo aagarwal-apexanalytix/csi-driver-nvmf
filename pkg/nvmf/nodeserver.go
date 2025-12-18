@@ -21,6 +21,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-driver-nvmf/pkg/utils"
@@ -173,19 +174,61 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
 
-	// Get the (now correctly parsed) device path
-	_, devicePath, err := getNvmeInfoByNqn(req.VolumeId)
-	if err != nil || devicePath == "" {
-		klog.Errorf("NodeExpandVolume: failed to find device for %s: %v", req.VolumeId, err)
-		return nil, status.Errorf(codes.Internal, "failed to find device for volume %s: %v", req.VolumeId, err)
+	volumeID := req.VolumeId
+	klog.Infof("NodeExpandVolume called for volume %s with required bytes %d", volumeID, req.CapacityRange.GetRequiredBytes())
+
+	var devicePath string
+	var err error
+
+	// Primary attempt: find existing controller/device
+	_, devicePath, err = getNvmeInfoByNqn(volumeID)
+	if err == nil && devicePath != "" {
+		klog.Infof("Found existing device %s for volume %s", devicePath, volumeID)
+	} else {
+		klog.Warningf("Initial device lookup failed for volume %s: %v — attempting recovery via persisted connector", volumeID, err)
+
+		// Recovery: load persisted connector and reconnect (idempotent)
+		connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
+		connector, loadErr := GetConnectorFromFile(connectorFilePath)
+		if loadErr != nil {
+			klog.Errorf("Failed to load persisted connector for recovery: %v", loadErr)
+			return nil, status.Errorf(codes.Internal, "failed to find device for volume %s and recovery failed: %v", volumeID, err)
+		}
+
+		// Reconnect (safe if already connected)
+		recoveredDevice, reconErr := connector.Connect()
+		if reconErr != nil {
+			klog.Errorf("Recovery reconnect failed for volume %s: %v", volumeID, reconErr)
+			return nil, status.Errorf(codes.Internal, "failed to recover connection for volume %s: %v", volumeID, reconErr)
+		}
+		if recoveredDevice == "" {
+			klog.Errorf("Recovery reconnect succeeded but returned empty device path for volume %s", volumeID)
+			return nil, status.Errorf(codes.Internal, "recovery reconnect for volume %s returned empty device path", volumeID)
+		}
+
+		// Wait for device to appear (reuse existing wait logic or simple sleep + retry)
+		maxRetries := 30 // ~60s total
+		for i := 0; i < maxRetries; i++ {
+			_, devicePath, err = getNvmeInfoByNqn(volumeID)
+			if err == nil && devicePath != "" {
+				klog.Infof("Recovery successful: device %s now available for volume %s", devicePath, volumeID)
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+		if devicePath == "" {
+			klog.Errorf("Recovery failed: device still not found after reconnect for volume %s", volumeID)
+			return nil, status.Errorf(codes.Internal, "failed to recover device for volume %s after reconnect", volumeID)
+		}
 	}
 
-	// Rescan ALL controllers matching the NQN (robust for single-path, future-proof for multi-path)
+	// Rescan ALL controllers matching the NQN (robust)
 	const ctlPath = "/sys/class/nvme-fabrics/ctl"
 	entries, err := os.ReadDir(ctlPath)
 	if err != nil {
-		klog.Errorf("NodeExpandVolume: failed to read %s: %v", ctlPath, err)
+		klog.Errorf("Failed to read %s during rescan: %v", ctlPath, err)
 	} else {
+		rescanTriggered := false
 		for _, entry := range entries {
 			if !strings.HasPrefix(entry.Name(), "nvme") {
 				continue
@@ -195,9 +238,9 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 			if err != nil {
 				continue
 			}
-			if strings.TrimSpace(string(data)) == req.VolumeId {
+			if strings.TrimSpace(string(data)) == volumeID {
 				scanPath := filepath.Join(ctlPath, entry.Name(), "rescan_controller")
-				klog.Infof("Triggering NVMe-oF controller rescan at %s for volume %s", scanPath, req.VolumeId)
+				klog.Infof("Triggering rescan at %s for volume %s", scanPath, volumeID)
 				if utils.IsFileExisting(scanPath) {
 					file, err := os.OpenFile(scanPath, os.O_WRONLY, 0666)
 					if err != nil {
@@ -208,17 +251,19 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 							klog.Errorf("Failed to trigger rescan on %s: %v", entry.Name(), err)
 						} else {
 							klog.Infof("Successfully triggered rescan for controller %s", entry.Name())
+							rescanTriggered = true
 						}
 					}
-				} else {
-					klog.Warningf("Rescan path %s not found — skipping", scanPath)
 				}
 			}
 		}
+		if !rescanTriggered {
+			klog.Warningf("No rescan paths found for volume %s (may already be updated)", volumeID)
+		}
 	}
 
-	// Online filesystem resize (ext4)
-	klog.Infof("Running online resize2fs on %s for volume %s", devicePath, req.VolumeId)
+	// Online filesystem resize
+	klog.Infof("Running online resize2fs on %s for volume %s", devicePath, volumeID)
 	out, err := exec.New().Command("resize2fs", devicePath).CombinedOutput()
 	if err != nil {
 		klog.Errorf("resize2fs failed for %s: %v\nOutput: %s", devicePath, err, string(out))
