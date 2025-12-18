@@ -177,7 +177,7 @@ func (n *NodeServer) NodeUnstageVolume(_ context.Context, _ *csi.NodeUnstageVolu
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
-func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	deviceName, err := GetDeviceNameByVolumeID(req.VolumeId)
 	if err != nil {
 		klog.Errorf("NodeExpandVolume: Get Device by volumeID: %s error %v", req.VolumeId, err)
@@ -185,21 +185,25 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 	}
 
 	scanPath := parseDeviceToControllerPath(deviceName)
-	if utils.IsFileExisting(scanPath) {
-		file, err := os.OpenFile(scanPath, os.O_RDWR|os.O_TRUNC, 0766)
-		if err != nil {
-			klog.Errorf("NodeExpandVolume: open scan path %s error: %v", scanPath, err)
-			return nil, status.Errorf(codes.Internal, "NodeExpandVolume: open scan path %s error: %v", scanPath, err)
-		}
-		err = utils.WriteStringToFile(file, "1")
-		if err != nil {
-			klog.Errorf("NodeExpandVolume: Rescan error: %v", err)
-			return nil, status.Errorf(codes.Internal, "NodeExpandVolume: Rescan error: %v", err)
-		}
-	} else {
+	klog.Infof("Triggering NVMe-oF controller rescan at %s for volume %s", scanPath, req.VolumeId)
+
+	if !utils.IsFileExisting(scanPath) {
 		return nil, status.Errorf(codes.Internal, "NodeExpandVolume: rescan path %s not exist", scanPath)
 	}
 
+	file, err := os.OpenFile(scanPath, os.O_WRONLY, 0666)
+	if err != nil {
+		klog.Errorf("NodeExpandVolume: open scan path %s error: %v", scanPath, err)
+		return nil, status.Errorf(codes.Internal, "NodeExpandVolume: open scan path %s error: %v", scanPath, err)
+	}
+	defer file.Close()
+
+	if _, err = file.WriteString("1"); err != nil {
+		klog.Errorf("NodeExpandVolume: Rescan write error: %v", err)
+		return nil, status.Errorf(codes.Internal, "NodeExpandVolume: Rescan write error: %v", err)
+	}
+
+	klog.Infof("Successfully triggered controller rescan for volume %s", req.VolumeId)
 	return &csi.NodeExpandVolumeResponse{}, nil
 }
 
