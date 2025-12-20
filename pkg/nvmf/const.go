@@ -33,6 +33,7 @@ const (
 	DefaultDriverVersion     = "v1.0.0"
 
 	DefaultVolumeMapPath = "/var/lib/kubelet/plugins/csi.nvmf.com/volumes"
+	sharedNFSRoot        = "/var/lib/kubelet/plugins/csi.nvmf.com/shared-nfs-root"
 )
 
 type GlobalConfig struct {

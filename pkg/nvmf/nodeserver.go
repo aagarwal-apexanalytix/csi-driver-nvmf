@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/kubernetes-csi/csi-driver-nvmf/pkg/utils"
+	"github.com/kubernetes-csi/csi-driver-nvmf/pkg/utils" // assuming this contains NVMe helpers
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -69,13 +69,13 @@ func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabi
 func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	// Pre-checks
 	if req.GetVolumeCapability() == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing Volume Capability in req.")
+		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing Volume Capability")
 	}
 	if len(req.GetVolumeId()) == 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing VolumeID in req.")
+		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing VolumeID")
 	}
 	if len(req.GetTargetPath()) == 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing TargetPath in req.")
+		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing TargetPath")
 	}
 
 	volCtx := req.GetVolumeContext()
@@ -84,60 +84,86 @@ func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVo
 
 	klog.Infof("NodePublishVolume: VolumeID %s publish to targetPath %s.", volumeID, targetPath)
 
-	// Detect provision mode from volume context
-	if nfsServer, hasNfs := volCtx["nfsServer"]; hasNfs {
-		// --- NFS RWX Filesystem Path ---
-		klog.V(4).Infof("NodePublishVolume: NFS mode detected for volume %s", volumeID)
+	provisionMode, hasProvisionMode := volCtx["provisionMode"]
 
-		nfsShare := volCtx["nfsShare"]
-		if nfsShare == "" {
-			return nil, status.Errorf(codes.InvalidArgument, "nfsShare missing in volume context")
+	if hasProvisionMode && provisionMode == "nfs" {
+		// --- NFS RWX Path (ROSE-compatible: shared root mount + bind-mount isolation) ---
+		klog.V(4).Infof("NodePublishVolume: NFS ROSE mode (bind-mount) for volume %s", volumeID)
+
+		nfsServer := volCtx["nfsServer"]
+		if nfsServer == "" {
+			return nil, status.Errorf(codes.InvalidArgument, "nfsServer missing in volume context")
+		}
+		nfsShare := volCtx["nfsShare"] // Expected "/"
+		volumeSubPath := volCtx["volumeSubPath"]
+		if nfsShare != "/" || volumeSubPath == "" {
+			return nil, status.Errorf(codes.InvalidArgument, "Invalid context for ROSE NFS (expected nfsShare=/ and volumeSubPath)")
 		}
 
-		// NFS only supports filesystem mount
+		// Only filesystem mount allowed
 		if req.GetVolumeCapability().GetBlock() != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "NFS-provisioned volumes only support filesystem mode (no raw block)")
+			return nil, status.Errorf(codes.InvalidArgument, "NFS-provisioned volumes only support filesystem mode")
 		}
 		if req.GetVolumeCapability().GetMount() == nil {
 			return nil, status.Errorf(codes.InvalidArgument, "Volume capability must be mount for NFS")
 		}
 
-		// Parse mount options
-		mountOptionsStr := volCtx["nfsMountOptions"]
+		// Mount options
 		var mountOptions []string
-		if mountOptionsStr != "" {
-			mountOptions = strings.Split(mountOptionsStr, ",")
+		if opts, ok := volCtx["nfsMountOptions"]; ok && opts != "" {
+			mountOptions = strings.Split(opts, ",")
 		}
 
-		// Check if already mounted (idempotent)
-		notMounted, err := n.mounter.IsLikelyNotMountPoint(targetPath)
+		source := nfsServer + ":/" // Full root export
+
+		// Create shared root directory
+		if err := os.MkdirAll(sharedNFSRoot, 0755); err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to create shared NFS root: %v", err)
+		}
+
+		// Mount shared root if not already mounted (idempotent)
+		isNotMount, err := n.mounter.IsLikelyNotMountPoint(sharedNFSRoot)
 		if err != nil && !os.IsNotExist(err) {
-			return nil, status.Errorf(codes.Internal, "Failed to check mount point %s: %v", targetPath, err)
+			return nil, status.Errorf(codes.Internal, "Failed to check shared mount point: %v", err)
 		}
-		if os.IsNotExist(err) {
-			// Target path does not exist – create it
-			if err := os.MkdirAll(targetPath, 0750); err != nil {
-				return nil, status.Errorf(codes.Internal, "Failed to create target path %s: %v", targetPath, err)
+		if isNotMount {
+			klog.Infof("Mounting shared NFS root %s to %s", source, sharedNFSRoot)
+			if err := n.mounter.Mount(source, sharedNFSRoot, "nfs", mountOptions); err != nil {
+				return nil, status.Errorf(codes.Internal, "Failed to mount shared NFS root: %v", err)
 			}
-			notMounted = true
+		} else {
+			klog.V(4).Infof("Shared NFS root already mounted at %s", sharedNFSRoot)
 		}
-		if !notMounted {
-			klog.Infof("NFS volume %s already mounted at %s (idempotent)", volumeID, targetPath)
+
+		// Bind-mount the specific subvolume directory
+		subPath := strings.TrimLeft(volumeSubPath, "/")
+		bindSrc := filepath.Join(sharedNFSRoot, subPath)
+
+		// Create target directory
+		if err := os.MkdirAll(targetPath, 0750); err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to create target path %s: %v", targetPath, err)
+		}
+
+		// Idempotent bind-mount
+		isNotMount, err = n.mounter.IsLikelyNotMountPoint(targetPath)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to check target mount point: %v", err)
+		}
+		if !isNotMount {
+			klog.Infof("Volume %s already published (bind) at %s", volumeID, targetPath)
 			return &csi.NodePublishVolumeResponse{}, nil
 		}
 
-		// Perform NFS mount
-		source := nfsServer + ":" + nfsShare
-		klog.Infof("Mounting NFS %s to %s with options %v", source, targetPath, mountOptions)
-		if err := n.mounter.Mount(source, targetPath, "nfs", mountOptions); err != nil {
-			return nil, status.Errorf(codes.Internal, "Failed to mount NFS %s to %s: %v", source, targetPath, err)
+		klog.Infof("Bind-mounting %s to %s", bindSrc, targetPath)
+		if err := n.mounter.Mount(bindSrc, targetPath, "", []string{"bind", "rbind"}); err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to bind-mount subvolume: %v", err)
 		}
 
-		klog.Infof("NFS volume %s successfully published at %s", volumeID, targetPath)
+		klog.Infof("NFS RWX volume %s successfully published (bind) at %s", volumeID, targetPath)
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
-	// --- NVMe-TCP Path (no NFS) ---
+	// --- NVMe-TCP Path (default / non-NFS) ---
 	klog.V(4).Infof("NodePublishVolume: NVMe mode for volume %s", volumeID)
 
 	// Connect remote disk (idempotent if already connected with same parameters)
@@ -145,7 +171,6 @@ func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVo
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "NodePublishVolume: get NVMf disk info from req err: %v", err)
 	}
-
 	connector := getNvmfConnector(nvmfInfo)
 	devicePath, err := connector.Connect()
 	if err != nil {
@@ -196,13 +221,25 @@ func (n *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubli
 	}
 
 	targetPath := req.GetTargetPath()
-	err := DetachDisk(targetPath)
-	if err != nil {
-		klog.Errorf("VolumeID: %s detachDisk err: %v", req.VolumeId, err)
-		return nil, err
+	volumeID := req.GetVolumeId()
+
+	// Always cleanup the target mount point (unmounts bind for NFS or filesystem/block bind for NVMe)
+	if err := mount.CleanupMountPoint(targetPath, n.mounter, true); err != nil {
+		klog.Errorf("Failed to cleanup mount point %s: %v", targetPath, err)
+		return nil, status.Errorf(codes.Internal, "Failed to unpublish %s: %v", targetPath, err)
 	}
 
-	klog.Infof("NodeUnpublishVolume completed for volume %s (connection and persistence preserved for NVMe)", req.VolumeId)
+	// If NVMe (connector file exists), disconnect the subsystem
+	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
+	if connector, err := GetConnectorFromFile(connectorFilePath); err == nil {
+		_ = connector.Disconnect()
+		removeConnectorFile(connectorFilePath)
+		klog.V(4).Infof("Disconnected NVMe subsystem for volume %s", volumeID)
+	}
+
+	// Shared NFS root remains mounted (harmless, shared across volumes)
+
+	klog.Infof("NodeUnpublishVolume completed for volume %s", req.VolumeId)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -218,7 +255,6 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 	if len(req.GetVolumeId()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
-
 	volumeID := req.VolumeId
 	klog.Infof("NodeExpandVolume called for volume %s with required bytes %d", volumeID, req.CapacityRange.GetRequiredBytes())
 
@@ -241,14 +277,12 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 		klog.Infof("Found existing device %s for volume %s", devicePath, volumeID)
 	} else {
 		klog.Warningf("Initial device lookup failed for volume %s: %v — attempting recovery via persisted connector", volumeID, err)
-
 		// Recovery: load persisted connector and reconnect
 		connector, loadErr := GetConnectorFromFile(connectorFilePath)
 		if loadErr != nil {
 			klog.Errorf("Failed to load persisted connector for recovery: %v", loadErr)
 			return nil, status.Errorf(codes.Internal, "failed to find device for volume %s and recovery failed: %v", volumeID, err)
 		}
-
 		recoveredDevice, reconErr := connector.Connect()
 		if reconErr != nil {
 			klog.Errorf("Recovery reconnect failed for volume %s: %v", volumeID, reconErr)
@@ -258,7 +292,6 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 			klog.Errorf("Recovery reconnect succeeded but returned empty device path for volume %s", volumeID)
 			return nil, status.Errorf(codes.Internal, "recovery reconnect for volume %s returned empty device path", volumeID)
 		}
-
 		// Wait for device to appear
 		maxRetries := 30
 		for i := 0; i < maxRetries; i++ {
@@ -356,7 +389,6 @@ func (n *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolum
 
 	// Raw block volumes are published as regular files (bind-mounted device file)
 	// NodeGetVolumeStats is not meaningful for raw block without a filesystem
-	// Return Unimplemented for block mode
 	if !stat.IsDir() {
 		klog.V(4).Infof("NodeGetVolumeStats: Volume %s is raw block (file), stats not supported", req.VolumeId)
 		return nil, status.Errorf(codes.Unimplemented, "NodeGetVolumeStats not supported for raw block volumes")
@@ -371,7 +403,6 @@ func (n *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolum
 	totalBytes := int64(statfs.Blocks * uint64(statfs.Bsize))
 	availableBytes := int64(statfs.Bfree * uint64(statfs.Bsize))
 	usedBytes := totalBytes - availableBytes
-
 	totalInodes := int64(statfs.Files)
 	freeInodes := int64(statfs.Ffree)
 	usedInodes := totalInodes - freeInodes
