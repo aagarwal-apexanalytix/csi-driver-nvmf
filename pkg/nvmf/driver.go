@@ -2,9 +2,7 @@
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -30,9 +28,8 @@ type driver struct {
 	idServer         *IdentityServer
 	nodeServer       *NodeServer
 	controllerServer *ControllerServer
-
-	cap   []*csi.VolumeCapability_AccessMode
-	cscap []*csi.ControllerServiceCapability
+	cap              []*csi.VolumeCapability_AccessMode
+	cscap            []*csi.ControllerServiceCapability
 }
 
 // NewDriver creates the identity/node/controller servers
@@ -54,31 +51,22 @@ func NewDriver(conf *GlobalConfig) *driver {
 }
 
 func (d *driver) Run(conf *GlobalConfig) {
-	// Advertise supported volume access modes (RWO, RWX, RWOP)
+	d.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{})
 	d.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
 		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
 	})
 
-	// Note: CREATE_DELETE_SNAPSHOT and LIST_SNAPSHOTS are conditional in GetCapabilities (static mode disables them)
-	d.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{
-		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
-		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
-		csi.ControllerServiceCapability_RPC_GET_CAPACITY,
-		csi.ControllerServiceCapability_RPC_GET_VOLUME,
-		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
-		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
-	})
-
 	d.idServer = NewIdentityServer(d)
 	d.nodeServer = NewNodeServer(d)
+
 	if conf.IsControllerServer {
 		d.controllerServer = NewControllerServer(d)
 	}
 
 	klog.Infof("Starting csi-plugin Driver: %v", d.name)
+
 	s := NewNonBlockingGRPCServer()
 	s.Start(conf.Endpoint, d.idServer, d.controllerServer, d.nodeServer)
 	s.Wait()
@@ -96,7 +84,6 @@ func (d *driver) AddVolumeCapabilityAccessModes(caps []csi.VolumeCapability_Acce
 
 func (d *driver) AddControllerServiceCapabilities(cl []csi.ControllerServiceCapability_RPC_Type) {
 	var csc []*csi.ControllerServiceCapability
-
 	for _, c := range cl {
 		klog.Infof("Enabling controller service capability: %v", c.String())
 		csc = append(csc, &csi.ControllerServiceCapability{
@@ -107,15 +94,13 @@ func (d *driver) AddControllerServiceCapabilities(cl []csi.ControllerServiceCapa
 			},
 		})
 	}
-
-	d.cscap = csc
+	d.cscap = append(d.cscap, csc...)
 }
 
 func (d *driver) ValidateControllerServiceRequest(c csi.ControllerServiceCapability_RPC_Type) error {
 	if c == csi.ControllerServiceCapability_RPC_UNKNOWN {
 		return nil
 	}
-
 	for _, cap := range d.cscap {
 		if c == cap.GetRpc().GetType() {
 			return nil

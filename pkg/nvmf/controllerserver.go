@@ -60,9 +60,12 @@ func NewControllerServer(d *driver) *ControllerServer {
 		password: os.Getenv("BACKEND_PASSWORD"),
 		provider: strings.ToLower(os.Getenv("CSI_PROVIDER")),
 	}
+
 	cs.initConfig()
+
 	klog.V(4).Infof("ControllerServer initialized: provider=%s, backendDisk=%s, backendMount=%s, restURL=%s",
 		cs.provider, cs.backendDisk, cs.backendMount, cs.restURL)
+
 	return cs
 }
 
@@ -70,18 +73,21 @@ func (cs *ControllerServer) initConfig() {
 	if cs.backendDisk == "" {
 		cs.backendDisk = "raid1"
 	}
-	cs.backendMount = ""
+	if cs.backendMount == "" {
+		cs.backendMount = "btrfs"
+	}
 	if cs.provider == "" {
 		cs.provider = ProviderStatic
 	}
 }
 
-// Generic REST helpers (unchanged)
+// Generic REST helper
 func (cs *ControllerServer) restDo(method, url string, body []byte, username, password string) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
+
 	req, err := http.NewRequest(method, url, reader)
 	if err != nil {
 		return nil, err
@@ -90,30 +96,36 @@ func (cs *ControllerServer) restDo(method, url string, body []byte, username, pa
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+
 	resp, err := cs.client.Do(req)
 	if err != nil {
 		klog.Errorf("REST %s %s failed: %v", method, url, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
 		klog.Errorf("REST %s %s error %d: %s", method, url, resp.StatusCode, string(respBody))
 		return nil, fmt.Errorf("REST error %d: %s", resp.StatusCode, string(respBody))
 	}
+
 	return respBody, nil
 }
 
+// Helper wrappers
 func (cs *ControllerServer) restGet(path, restURL, username, password string) ([]map[string]interface{}, error) {
 	body, err := cs.restDo("GET", restURL+path, nil, username, password)
 	if err != nil {
 		return nil, err
 	}
+
 	var result []map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
 		klog.Errorf("Failed to decode REST GET %s: %v", path, err)
 		return nil, err
 	}
+
 	klog.V(5).Infof("REST GET %s returned %d items", path, len(result))
 	return result, nil
 }
@@ -135,11 +147,13 @@ func (cs *ControllerServer) restDelete(path, restURL, username, password string)
 	return err
 }
 
+// Get .id for a disk by slot
 func (cs *ControllerServer) getDiskID(slot, restURL, username, password string) (string, error) {
 	disks, err := cs.restGet("/disk", restURL, username, password)
 	if err != nil {
 		return "", err
 	}
+
 	for _, d := range disks {
 		if s, ok := d["slot"].(string); ok && s == slot {
 			id, ok := d[".id"].(string)
@@ -151,6 +165,7 @@ func (cs *ControllerServer) getDiskID(slot, restURL, username, password string) 
 	return "", fmt.Errorf("disk with slot %s not found or missing .id", slot)
 }
 
+// Parse size string to bytes
 func parseSizeToBytes(s string) int64 {
 	if s == "" {
 		return 0
@@ -159,6 +174,7 @@ func parseSizeToBytes(s string) int64 {
 	s = strings.TrimSuffix(s, "GIB")
 	s = strings.TrimSuffix(s, "GI")
 	s = strings.TrimSuffix(s, "G")
+
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
 		klog.Warningf("Failed to parse size string '%s': %v", s, err)
@@ -167,12 +183,15 @@ func parseSizeToBytes(s string) int64 {
 	return int64(f * 1024 * 1024 * 1024)
 }
 
+// Check if volume/slot exists
 func (cs *ControllerServer) volumeExists(volumeID, restURL, username, password string) (bool, int64, error) {
 	klog.V(5).Infof("Checking existence of volume/slot %s", volumeID)
+
 	disks, err := cs.restGet("/disk", restURL, username, password)
 	if err != nil {
 		return false, 0, err
 	}
+
 	for _, d := range disks {
 		if s, ok := d["slot"].(string); ok && s == volumeID {
 			sizeStr, _ := d["file-size"].(string)
@@ -184,12 +203,14 @@ func (cs *ControllerServer) volumeExists(volumeID, restURL, username, password s
 			return true, sizeBytes, nil
 		}
 	}
+
 	klog.V(5).Infof("Volume/slot %s does not exist", volumeID)
 	return false, 0, nil
 }
 
 func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	cs.initConfig()
+
 	klog.V(4).Infof("CreateVolume requested: name=%s, capacityRange=%v, parameters=%v, contentSource=%v",
 		req.GetName(), req.CapacityRange, req.Parameters, req.VolumeContentSource)
 
@@ -203,6 +224,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	}
 
 	params := req.Parameters
+
 	targetAddr, ok := params["targetAddr"]
 	if !ok || targetAddr == "" {
 		return nil, status.Error(codes.InvalidArgument, "targetAddr is required in StorageClass parameters")
@@ -217,14 +239,15 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if backendDisk == "" {
 		backendDisk = cs.backendDisk
 	}
-
-	// backendMount overridden but default is "" for root-level subvols
+	backendMount := params["backendMount"]
+	if backendMount == "" {
+		backendMount = cs.backendMount
+	}
 
 	volumeID := strings.ReplaceAll(strings.ToLower(req.Name), "-", "")
 	slot := volumeID
 	subVolName := "vol-" + volumeID
-	subVolPath := "/" + subVolName // root-level: /vol-xxxx
-	imgPath := subVolPath + "/volume.img"
+	imgPath := backendMount + "/" + subVolName + "/volume.img"
 	sizeGiB := fmt.Sprintf("%dG", capBytes/(1024*1024*1024))
 
 	var fromSnapshot string
@@ -235,20 +258,6 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		if vol := source.GetVolume(); vol != nil {
 			return nil, status.Error(codes.InvalidArgument, "Volume cloning not supported")
 		}
-	}
-
-	// Detect RWX filesystem request
-	isFilesystemRWX := false
-	for _, capability := range req.VolumeCapabilities {
-		if capability.GetMount() != nil && capability.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER {
-			isFilesystemRWX = true
-			break
-		}
-	}
-
-	nfsOptions := params["nfsOptions"]
-	if nfsOptions == "" {
-		nfsOptions = "vers=4.1,soft,timeo=600"
 	}
 
 	if cs.provider == ProviderStatic {
@@ -264,12 +273,11 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 				VolumeId:      volumeID,
 				CapacityBytes: capBytes,
 				VolumeContext: map[string]string{
-					"targetTrAddr":  targetAddr,
-					"targetTrPort":  targetPort,
-					"targetTrType":  "tcp",
-					"nqn":           slot,
-					"deviceID":      slot,
-					"provisionMode": "nvme",
+					"targetTrAddr": targetAddr,
+					"targetTrPort": targetPort,
+					"targetTrType": "tcp",
+					"nqn":          slot,
+					"deviceID":     slot,
 				},
 			},
 		}, nil
@@ -282,6 +290,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if localRestURL == "" {
 		return nil, status.Error(codes.InvalidArgument, "restURL required")
 	}
+
 	localUsername := params["username"]
 	if localUsername == "" {
 		localUsername = cs.username
@@ -289,6 +298,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if localUsername == "" {
 		return nil, status.Error(codes.InvalidArgument, "username required")
 	}
+
 	localPassword := params["password"]
 	if localPassword == "" {
 		localPassword = cs.password
@@ -297,171 +307,120 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		return nil, status.Error(codes.InvalidArgument, "password required")
 	}
 
-	klog.V(4).Infof("Using MikroTik REST API: url=%s, username=%s", localRestURL, localUsername)
+	klog.V(4).Infof("Using MikroTik REST API: url=%s, username=%s, password_length=%d", localRestURL, localUsername, len(localPassword))
 
+	// Idempotency check
 	exists, currentSize, err := cs.volumeExists(volumeID, localRestURL, localUsername, localPassword)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to check existing volume: %v", err)
 	}
-
-	if isFilesystemRWX {
-		// --- NFS RWX Filesystem Path (ROSE-compatible with shared root + bind-mount in NodeServer) ---
-		klog.V(4).Infof("Provisioning RWX filesystem volume via NFS ROSE: %s (subvol=%s)", volumeID, subVolName)
-
-		// Create Btrfs subvolume (directory only, idempotent)
-		subvolData := map[string]string{
-			"fs":   backendDisk,
-			"name": subVolName,
-		}
-		if fromSnapshot != "" {
-			subvolData["parent"] = fromSnapshot
-		}
-		if err := cs.restPost("/disk/btrfs/subvolume/add", subvolData, localRestURL, localUsername, localPassword); err != nil {
-			if strings.Contains(err.Error(), "exists") {
-				klog.V(4).Infof("Subvolume %s already exists (idempotent)", subVolName)
-			} else {
-				return nil, status.Errorf(codes.Internal, "Btrfs subvolume create failed: %v", err)
-			}
-		}
-
-		// Enable NFS sharing on the backend disk (idempotent, exports entire root as /)
-		diskID, err := cs.getDiskID(backendDisk, localRestURL, localUsername, localPassword)
-		if err != nil {
-			_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
-			return nil, status.Errorf(codes.Internal, "Failed to find backend disk %s for NFS sharing: %v", backendDisk, err)
-		}
-		shareData := map[string]string{"nfs-sharing": "yes"}
-		if err := cs.restPatch("/disk/"+diskID, shareData, localRestURL, localUsername, localPassword); err != nil {
-			klog.Warningf("PATCH nfs-sharing failed: %v – trying SET", err)
-			setData := map[string]string{
-				"numbers":     diskID,
-				"nfs-sharing": "yes",
-			}
-			if err2 := cs.restPost("/disk/set", setData, localRestURL, localUsername, localPassword); err2 != nil {
-				_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
-				return nil, status.Errorf(codes.Internal, "Failed to enable NFS sharing on backend disk: %v / %v", err, err2)
-			}
-		}
-		klog.V(4).Infof("NFS sharing enabled on backend disk %s (idempotent)", backendDisk)
-
-		return &csi.CreateVolumeResponse{
-			Volume: &csi.Volume{
-				VolumeId:      volumeID,
-				CapacityBytes: 0, // Unbounded directory
-				VolumeContext: map[string]string{
-					"nfsServer":       targetAddr,
-					"nfsShare":        "/", // Full root export (NodeServer uses bind-mount)
-					"nfsMountOptions": nfsOptions,
-					"provisionMode":   "nfs",
-					"volumeSubPath":   subVolName, // e.g. vol-xxxx (for bind-mount in NodeServer)
-				},
-			},
-		}, nil
-	} else {
-		// --- NVMe-TCP Path (RWO / block, bounded) ---
-		if exists {
-			if currentSize >= capBytes {
-				klog.V(4).Infof("Volume %s already exists with sufficient size (%d >= %d bytes)", volumeID, currentSize, capBytes)
-				return &csi.CreateVolumeResponse{
-					Volume: &csi.Volume{
-						VolumeId:      volumeID,
-						CapacityBytes: currentSize,
-						VolumeContext: map[string]string{
-							"targetTrAddr":  targetAddr,
-							"targetTrPort":  targetPort,
-							"targetTrType":  "tcp",
-							"nqn":           slot,
-							"deviceID":      slot,
-							"provisionMode": "nvme",
-						},
+	if exists {
+		if currentSize >= capBytes {
+			klog.V(4).Infof("Volume %s already exists with sufficient size (%d >= %d bytes)", volumeID, currentSize, capBytes)
+			return &csi.CreateVolumeResponse{
+				Volume: &csi.Volume{
+					VolumeId:      volumeID,
+					CapacityBytes: currentSize,
+					VolumeContext: map[string]string{
+						"targetTrAddr": targetAddr,
+						"targetTrPort": targetPort,
+						"targetTrType": "tcp",
+						"nqn":          slot,
+						"deviceID":     slot,
 					},
-				}, nil
-			}
-			return nil, status.Error(codes.AlreadyExists, "Volume exists with smaller size than requested")
+				},
+			}, nil
 		}
+		return nil, status.Error(codes.AlreadyExists, "Volume exists with smaller size than requested")
+	}
 
-		klog.V(4).Infof("Provisioning NVMe volume %s (slot=%s, size=%s, fromSnapshot=%s)", req.Name, slot, sizeGiB, fromSnapshot)
+	klog.V(4).Infof("Provisioning new volume %s (slot=%s, size=%s, fromSnapshot=%s)", req.Name, slot, sizeGiB, fromSnapshot)
 
-		// Create Btrfs subvolume (container for the .img file)
-		subvolData := map[string]string{
-			"fs":   backendDisk,
-			"name": subVolName,
+	// Create BTRFS subvolume
+	subvolData := map[string]string{
+		"fs":   backendDisk,
+		"name": subVolName,
+	}
+	if fromSnapshot != "" {
+		subvolData["parent"] = fromSnapshot
+		subvolData["read-only"] = "yes"
+	}
+	err = cs.restPost("/disk/btrfs/subvolume/add", subvolData, localRestURL, localUsername, localPassword)
+	if err != nil {
+		if strings.Contains(err.Error(), "exists") || strings.Contains(err.Error(), "File exists") {
+			klog.V(4).Infof("Subvolume %s already exists (idempotent)", subVolName)
+		} else {
+			return nil, status.Errorf(codes.Internal, "Subvolume create failed: %v", err)
 		}
-		if fromSnapshot != "" {
-			subvolData["parent"] = fromSnapshot
-			subvolData["read-only"] = "yes"
-		}
-		if err = cs.restPost("/disk/btrfs/subvolume/add", subvolData, localRestURL, localUsername, localPassword); err != nil {
-			if strings.Contains(err.Error(), "exists") || strings.Contains(err.Error(), "File exists") {
-				klog.V(4).Infof("Subvolume %s already exists (idempotent)", subVolName)
-			} else {
-				return nil, status.Errorf(codes.Internal, "Subvolume create failed: %v", err)
-			}
-		}
+	}
 
-		// Create file-backed virtual disk
-		diskData := map[string]string{
-			"type":      "file",
-			"file-path": imgPath,
-			"file-size": sizeGiB,
-			"slot":      slot,
-		}
-		if err := cs.restPost("/disk/add", diskData, localRestURL, localUsername, localPassword); err != nil {
-			_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
-			return nil, status.Errorf(codes.Internal, "Disk create failed: %v", err)
-		}
+	// Create file-backed disk
+	diskData := map[string]string{
+		"type":      "file",
+		"file-path": imgPath,
+		"file-size": sizeGiB,
+		"slot":      slot,
+	}
+	if err := cs.restPost("/disk/add", diskData, localRestURL, localUsername, localPassword); err != nil {
+		_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
+		return nil, status.Errorf(codes.Internal, "Disk create failed: %v", err)
+	}
 
-		// Get .id and enable NVMe-TCP export
-		diskID, err := cs.getDiskID(slot, localRestURL, localUsername, localPassword)
-		if err != nil {
-			_ = cs.restDelete("/disk/"+slot, localRestURL, localUsername, localPassword)
-			_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
-			return nil, status.Errorf(codes.Internal, "Failed to retrieve disk .id for export: %v", err)
-		}
+	// Get .id for reliable addressing
+	diskID, err := cs.getDiskID(slot, localRestURL, localUsername, localPassword)
+	if err != nil {
+		// Best-effort cleanup using slot fallback
+		_ = cs.restDelete("/disk/"+slot, localRestURL, localUsername, localPassword)
+		_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
+		return nil, status.Errorf(codes.Internal, "Failed to retrieve disk .id for export: %v", err)
+	}
 
-		exportData := map[string]string{
+	// Enable NVMe-TCP export using .id
+	exportData := map[string]string{
+		"nvme-tcp-export": "yes",
+		"nvme-tcp-port":   targetPort,
+	}
+	err = cs.restPatch("/disk/"+diskID, exportData, localRestURL, localUsername, localPassword)
+	if err != nil {
+		klog.Warningf("PATCH export by .id failed, trying SET by .id: %v", err)
+		setData := map[string]string{
+			"numbers":         diskID,
 			"nvme-tcp-export": "yes",
 			"nvme-tcp-port":   targetPort,
 		}
-		err = cs.restPatch("/disk/"+diskID, exportData, localRestURL, localUsername, localPassword)
-		if err != nil {
-			klog.Warningf("PATCH export failed, trying SET: %v", err)
-			setData := map[string]string{
-				"numbers":         diskID,
-				"nvme-tcp-export": "yes",
-				"nvme-tcp-port":   targetPort,
-			}
-			if err2 := cs.restPost("/disk/set", setData, localRestURL, localUsername, localPassword); err2 != nil {
-				_ = cs.restDelete("/disk/"+diskID, localRestURL, localUsername, localPassword)
-				_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
-				return nil, status.Errorf(codes.Internal, "Export enable failed: %v / %v", err, err2)
-			}
+		if err2 := cs.restPost("/disk/set", setData, localRestURL, localUsername, localPassword); err2 != nil {
+			// Cleanup
+			_ = cs.restDelete("/disk/"+diskID, localRestURL, localUsername, localPassword)
+			_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
+			return nil, status.Errorf(codes.Internal, "Export enable failed (PATCH .id: %v, SET .id: %v)", err, err2)
 		}
-
-		klog.V(4).Infof("Successfully created NVMe volume %s (%d bytes)", volumeID, capBytes)
-		return &csi.CreateVolumeResponse{
-			Volume: &csi.Volume{
-				VolumeId:      volumeID,
-				CapacityBytes: capBytes,
-				VolumeContext: map[string]string{
-					"targetTrAddr":  targetAddr,
-					"targetTrPort":  targetPort,
-					"targetTrType":  "tcp",
-					"nqn":           slot,
-					"deviceID":      slot,
-					"provisionMode": "nvme",
-				},
-			},
-		}, nil
 	}
+
+	klog.V(4).Infof("Successfully created volume %s (size %d bytes)", volumeID, capBytes)
+
+	return &csi.CreateVolumeResponse{
+		Volume: &csi.Volume{
+			VolumeId:      volumeID,
+			CapacityBytes: capBytes,
+			VolumeContext: map[string]string{
+				"targetTrAddr": targetAddr,
+				"targetTrPort": targetPort,
+				"targetTrType": "tcp",
+				"nqn":          slot,
+				"deviceID":     slot,
+			},
+		},
+	}, nil
 }
 
 func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	cs.initConfig()
+
 	volumeID := req.VolumeId
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "VolumeId required")
 	}
+
 	klog.V(4).Infof("DeleteVolume requested for volume %s", volumeID)
 
 	if cs.provider == ProviderStatic {
@@ -472,31 +431,27 @@ func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
 	slot := volumeID
 	subVolName := "vol-" + volumeID
 
-	exists, _, _ := cs.volumeExists(volumeID, cs.restURL, cs.username, cs.password)
-	if exists {
-		// --- NVMe Cleanup ---
-		diskID, _ := cs.getDiskID(slot, cs.restURL, cs.username, cs.password)
-		if diskID != "" {
-			_ = cs.restPatch("/disk/"+diskID, map[string]string{"nvme-tcp-export": "no"}, cs.restURL, cs.username, cs.password)
-			_ = cs.restDelete("/disk/"+diskID, cs.restURL, cs.username, cs.password)
-		} else {
-			_ = cs.restPatch("/disk/"+slot, map[string]string{"nvme-tcp-export": "no"}, cs.restURL, cs.username, cs.password)
-			_ = cs.restDelete("/disk/"+slot, cs.restURL, cs.username, cs.password)
-		}
-		klog.V(4).Infof("NVMe cleanup completed for volume %s", volumeID)
+	// Best-effort disable export
+	diskID, _ := cs.getDiskID(slot, cs.restURL, cs.username, cs.password)
+	if diskID != "" {
+		_ = cs.restPatch("/disk/"+diskID, map[string]string{"nvme-tcp-export": "no"}, cs.restURL, cs.username, cs.password)
+		_ = cs.restDelete("/disk/"+diskID, cs.restURL, cs.username, cs.password)
 	} else {
-		// --- NFS RWX Cleanup (ROSE mode: no per-share cleanup needed) ---
-		klog.V(4).Infof("NFS ROSE cleanup for volume %s: leaving nfs-sharing enabled (shared export)", volumeID)
+		// Fallback to slot
+		_ = cs.restPatch("/disk/"+slot, map[string]string{"nvme-tcp-export": "no"}, cs.restURL, cs.username, cs.password)
+		_ = cs.restDelete("/disk/"+slot, cs.restURL, cs.username, cs.password)
 	}
 
-	// Common: delete Btrfs subvolume (best-effort)
+	// Delete subvolume
 	_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, cs.restURL, cs.username, cs.password)
-	klog.V(4).Infof("Deletion completed for volume %s", volumeID)
+
+	klog.V(4).Infof("Deletion completed for volume %s (best-effort)", volumeID)
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
 func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
 	cs.initConfig()
+
 	slot := req.VolumeId
 	if slot == "" {
 		return nil, status.Error(codes.InvalidArgument, "VolumeId required")
@@ -513,25 +468,18 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 		return nil, status.Error(codes.Unimplemented, "Expansion not supported in static mode")
 	}
 
-	// Check if NVMe disk exists
-	exists, _, err := cs.volumeExists(slot, cs.restURL, cs.username, cs.password)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to check volume type: %v", err)
-	}
-
-	if !exists {
-		return nil, status.Error(codes.Unimplemented, "Volume expansion not supported for NFS-provisioned (RWX) volumes")
-	}
-
 	newGiB := fmt.Sprintf("%dG", newBytes/(1024*1024*1024))
 
+	// Get .id
 	diskID, err := cs.getDiskID(slot, cs.restURL, cs.username, cs.password)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to get disk .id for expansion: %v", err)
 	}
 
+	// Try PATCH by .id
 	err = cs.restPatch("/disk/"+diskID, map[string]string{"file-size": newGiB}, cs.restURL, cs.username, cs.password)
 	if err != nil {
+		// Fallback SET by .id
 		if err2 := cs.restPost("/disk/set", map[string]string{
 			"numbers":   diskID,
 			"file-size": newGiB,
@@ -549,6 +497,7 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 
 func (cs *ControllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	cs.initConfig()
+
 	if cs.provider == ProviderStatic {
 		return &csi.ListVolumesResponse{Entries: []*csi.ListVolumesResponse_Entry{}}, nil
 	}
@@ -564,15 +513,18 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesReq
 		if slot == "" || !strings.HasPrefix(slot, "pvc") {
 			continue
 		}
+
 		export, _ := d["nvme-tcp-export"].(string)
 		if export != "yes" {
 			continue
 		}
+
 		sizeStr, _ := d["file-size"].(string)
 		if sizeStr == "" {
 			sizeStr, _ = d["size"].(string)
 		}
 		capBytes := parseSizeToBytes(sizeStr)
+
 		entries = append(entries, &csi.ListVolumesResponse_Entry{
 			Volume: &csi.Volume{
 				VolumeId:      slot,
@@ -587,6 +539,7 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesReq
 
 func (cs *ControllerServer) GetCapacity(_ context.Context, _ *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
 	cs.initConfig()
+
 	if cs.provider == ProviderStatic {
 		return &csi.GetCapacityResponse{AvailableCapacity: 0}, nil
 	}
@@ -611,6 +564,7 @@ func (cs *ControllerServer) GetCapacity(_ context.Context, _ *csi.GetCapacityReq
 
 func (cs *ControllerServer) ControllerGetVolume(_ context.Context, req *csi.ControllerGetVolumeRequest) (*csi.ControllerGetVolumeResponse, error) {
 	cs.initConfig()
+
 	slot := req.VolumeId
 	if slot == "" {
 		return nil, status.Error(codes.InvalidArgument, "VolumeId required")
@@ -648,23 +602,27 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *c
 	klog.V(5).Infof("ValidateVolumeCapabilities requested for volume %s with %d capabilities", req.VolumeId, len(req.VolumeCapabilities))
 
 	supported := true
-	for _, capability := range req.VolumeCapabilities {
-		if capability.GetBlock() == nil && capability.GetMount() == nil {
-			supported = false
-			continue
-		}
-		// Prevent mixed block + mount
-		if capability.GetBlock() != nil && capability.GetMount() != nil {
+	for _, cap := range req.VolumeCapabilities {
+		if cap.GetBlock() == nil && cap.GetMount() == nil {
 			supported = false
 			continue
 		}
 
-		mode := capability.GetAccessMode().GetMode()
-		// Allow RWO, RWX, RWOP for both block and filesystem mount (RWX via NFS)
-		if mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER &&
-			mode != csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER &&
-			mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
-			supported = false
+		mode := cap.GetAccessMode().GetMode()
+
+		if cap.GetBlock() != nil {
+			// Raw block: allow RWO, RWX (for KubeVirt migration), RWOP
+			if mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER &&
+				mode != csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER &&
+				mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
+				supported = false
+			}
+		} else {
+			// Filesystem mount: allow RWO and RWOP only (no multi-node sharing)
+			if mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER &&
+				mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {
+				supported = false
+			}
 		}
 	}
 
@@ -675,6 +633,7 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *c
 			},
 		}, nil
 	}
+
 	return &csi.ValidateVolumeCapabilitiesResponse{}, nil
 }
 
@@ -690,6 +649,7 @@ func (cs *ControllerServer) ControllerUnpublishVolume(_ context.Context, _ *csi.
 
 func (cs *ControllerServer) CreateSnapshot(_ context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
 	cs.initConfig()
+
 	sourceVol := req.SourceVolumeId
 	snapName := req.Name
 	if sourceVol == "" || snapName == "" {
@@ -703,6 +663,7 @@ func (cs *ControllerServer) CreateSnapshot(_ context.Context, req *csi.CreateSna
 	}
 
 	params := req.Parameters
+
 	localRestURL := params["restURL"]
 	if localRestURL == "" {
 		localRestURL = cs.restURL
@@ -747,6 +708,7 @@ func (cs *ControllerServer) CreateSnapshot(_ context.Context, req *csi.CreateSna
 	}
 
 	klog.V(4).Infof("Successfully created snapshot %s from volume %s", snapSubVol, sourceVol)
+
 	return &csi.CreateSnapshotResponse{
 		Snapshot: &csi.Snapshot{
 			SnapshotId:     snapSubVol,
@@ -760,6 +722,7 @@ func (cs *ControllerServer) CreateSnapshot(_ context.Context, req *csi.CreateSna
 
 func (cs *ControllerServer) DeleteSnapshot(_ context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
 	cs.initConfig()
+
 	snapSubVol := req.SnapshotId
 	if snapSubVol == "" {
 		return nil, status.Error(codes.InvalidArgument, "SnapshotId required")
@@ -772,18 +735,22 @@ func (cs *ControllerServer) DeleteSnapshot(_ context.Context, req *csi.DeleteSna
 	}
 
 	_ = cs.restDelete("/disk/btrfs/subvolume/"+snapSubVol, cs.restURL, cs.username, cs.password)
+
 	klog.V(4).Infof("Snapshot %s deleted (best-effort)", snapSubVol)
 	return &csi.DeleteSnapshotResponse{}, nil
 }
 
 func (cs *ControllerServer) ListSnapshots(_ context.Context, _ *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
 	cs.initConfig()
+
 	klog.V(4).Infof("ListSnapshots requested (placeholder implementation)")
+
 	return &csi.ListSnapshotsResponse{Entries: []*csi.ListSnapshotsResponse_Entry{}}, nil
 }
 
 func (cs *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 	klog.V(5).Infof("ControllerGetCapabilities requested")
+
 	caps := []*csi.ControllerServiceCapability{
 		{Type: &csi.ControllerServiceCapability_Rpc{Rpc: &csi.ControllerServiceCapability_RPC{Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME}}},
 		{Type: &csi.ControllerServiceCapability_Rpc{Rpc: &csi.ControllerServiceCapability_RPC{Type: csi.ControllerServiceCapability_RPC_EXPAND_VOLUME}}},
@@ -791,11 +758,13 @@ func (cs *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.
 		{Type: &csi.ControllerServiceCapability_Rpc{Rpc: &csi.ControllerServiceCapability_RPC{Type: csi.ControllerServiceCapability_RPC_GET_CAPACITY}}},
 		{Type: &csi.ControllerServiceCapability_Rpc{Rpc: &csi.ControllerServiceCapability_RPC{Type: csi.ControllerServiceCapability_RPC_GET_VOLUME}}},
 	}
+
 	if cs.provider != ProviderStatic {
 		caps = append(caps,
 			&csi.ControllerServiceCapability{Type: &csi.ControllerServiceCapability_Rpc{Rpc: &csi.ControllerServiceCapability_RPC{Type: csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT}}},
 			&csi.ControllerServiceCapability{Type: &csi.ControllerServiceCapability_Rpc{Rpc: &csi.ControllerServiceCapability_RPC{Type: csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS}}},
 		)
 	}
+
 	return &csi.ControllerGetCapabilitiesResponse{Capabilities: caps}, nil
 }

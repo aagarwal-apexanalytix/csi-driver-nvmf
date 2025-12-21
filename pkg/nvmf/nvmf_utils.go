@@ -103,7 +103,6 @@ func getNvmeInfoByNqn(nqn string) (controller string, devicePath string, err err
 }
 
 // GetDeviceNameByVolumeID returns the local device path for a given volume ID (NQN).
-// NVMe-specific – not used for NFS RWX volumes.
 func GetDeviceNameByVolumeID(volumeID string) (string, error) {
 	_, devicePath, err := getNvmeInfoByNqn(volumeID)
 	if err != nil {

@@ -2,9 +2,7 @@
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -38,7 +36,7 @@ type nvmfDiskInfo struct {
 }
 
 // getNVMfDiskInfo extracts NVMe-oF connection parameters from the volume context.
-// This is only used for NVMe-provisioned volumes (provisionMode: "nvme").
+// This is used for all volumes (only NVMe-oF provisioned volumes are supported).
 func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 	volName := req.GetVolumeId()
 	volOpts := req.GetVolumeContext()
@@ -64,6 +62,7 @@ func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 	}
 
 	nqn := volOpts["nqn"]
+
 	if targetTrAddr == "" || nqn == "" || targetTrPort == "" || targetTrType == "" || deviceID == "" {
 		return nil, fmt.Errorf("some nvme target info is missing, volID: %s ", volName)
 	}
@@ -81,8 +80,6 @@ func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 }
 
 // AttachDisk handles publishing the NVMe device (raw block or formatted filesystem).
-// This function is only called for NVMe-provisioned volumes (provisionMode: "nvme").
-// NFS RWX volumes bypass this entirely (direct NFS mount in NodePublishVolume).
 func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: exec.New()}
 	targetPath := req.GetTargetPath()
@@ -162,7 +159,7 @@ func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 }
 
 // DetachDisk performs unmount and cleanup of the target path.
-// This works for both NVMe mounts and NFS mounts (generic unmount).
+// This is a generic helper for NVMe device unmounts (both block bind and filesystem mounts).
 func DetachDisk(targetPath string) (err error) {
 	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: exec.New()}
 
@@ -176,10 +173,12 @@ func DetachDisk(targetPath string) (err error) {
 			klog.Errorf("nvmf detach disk: failed to unmount: %s\nError: %v", targetPath, err)
 			return err
 		}
+
 		// Delete the mount point (safe for both block file and directory)
 		if err = os.RemoveAll(targetPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to remove target path: %w", err)
 		}
 	}
+
 	return nil
 }
