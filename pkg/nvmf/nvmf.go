@@ -7,8 +7,7 @@ Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
-limitations under the License.
-*/
+limitations under the License. */
 
 package nvmf
 
@@ -22,6 +21,10 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/exec"
 	"k8s.io/utils/mount"
+)
+
+const (
+	blockRawFileName = "volume"
 )
 
 type nvmfDiskInfo struct {
@@ -40,7 +43,6 @@ type nvmfDiskInfo struct {
 func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 	volName := req.GetVolumeId()
 	volOpts := req.GetVolumeContext()
-
 	targetTrAddr := volOpts["targetTrAddr"]
 	targetTrPort := volOpts["targetTrPort"]
 	targetTrType := volOpts["targetTrType"]
@@ -81,104 +83,138 @@ func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 
 // AttachDisk handles publishing the NVMe device (raw block or formatted filesystem).
 func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
-	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: exec.New()}
 	targetPath := req.GetTargetPath()
+	mounter := mount.New("")
+	safeMounter := &mount.SafeFormatAndMount{
+		Interface: mounter,
+		Exec:      exec.New(),
+	}
 
-	if req.GetVolumeCapability().GetBlock() != nil {
-		// Raw block: bind-mount the device file
-		dir := filepath.Dir(targetPath)
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return fmt.Errorf("failed to create dir of target block file: %s, err: %v", targetPath, err)
-			}
+	if req.GetVolumeCapability() == nil {
+		return fmt.Errorf("volume capability missing in request")
+	}
+
+	if block := req.GetVolumeCapability().GetBlock(); block != nil {
+		// ==== Raw block volume ====
+		if err := os.MkdirAll(targetPath, 0755); err != nil {
+			return fmt.Errorf("failed to create publish directory %s: %w", targetPath, err)
 		}
 
-		// Create placeholder file if not exists
-		file, err := os.Stat(targetPath)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				return fmt.Errorf("failed to stat target block file exist %s, err: %v", targetPath, err)
-			}
-			newFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_RDWR, 0750)
-			if err != nil {
-				return fmt.Errorf("failed to open target block file: %s, err: %v", targetPath, err)
-			}
-			if err := newFile.Close(); err != nil {
-				return fmt.Errorf("failed to close target block file: %s, err: %v", targetPath, err)
-			}
-		} else {
-			if file.Mode()&os.ModeDevice == os.ModeDevice {
-				klog.Warning("AttachDisk Warning: Map skipped because bind mount already exist on the path: %v", targetPath)
+		blockFile := filepath.Join(targetPath, blockRawFileName)
+
+		// Check if already published correctly (bind-mount exists and is a device)
+		if fi, err := os.Lstat(blockFile); err == nil {
+			if (fi.Mode() & os.ModeDevice) != 0 {
+				klog.V(4).Infof("AttachDisk: raw block already published correctly at %s", blockFile)
 				return nil
 			}
 		}
 
-		if err := mounter.MountSensitive(devicePath, targetPath, "", []string{"bind"}, nil); err != nil {
-			klog.Errorf("AttachDisk: failed to mount Device %s to %s, err: %v", devicePath, targetPath, err)
-			return fmt.Errorf("failed to mount Device %s to %s, err: %v", devicePath, targetPath, err)
+		// Create placeholder file if missing
+		if _, err := os.Stat(blockFile); os.IsNotExist(err) {
+			f, createErr := os.OpenFile(blockFile, os.O_CREATE|os.O_WRONLY, 0660)
+			if createErr != nil {
+				return fmt.Errorf("failed to create block placeholder file %s: %w", blockFile, createErr)
+			}
+			f.Close()
 		}
-	} else if req.GetVolumeCapability().GetMount() != nil {
-		// Filesystem mount on NVMe device
-		notMounted, err := mounter.IsLikelyNotMountPoint(targetPath)
+
+		// Bind-mount the device to the placeholder file
+		mountOptions := []string{"bind"}
+		if req.GetReadonly() {
+			mountOptions = append(mountOptions, "ro")
+		}
+		if err := mounter.Mount(devicePath, blockFile, "", mountOptions); err != nil {
+			// Cleanup placeholder on failure
+			_ = os.Remove(blockFile)
+			return fmt.Errorf("failed to bind-mount device %s to %s: %w", devicePath, blockFile, err)
+		}
+
+		klog.Infof("AttachDisk: Successfully published raw block device %s to %s", devicePath, blockFile)
+		return nil
+	}
+
+	if mountCap := req.GetVolumeCapability().GetMount(); mountCap != nil {
+		// ==== Filesystem volume ====
+		notMounted, err := safeMounter.IsLikelyNotMountPoint(targetPath)
 		if err != nil {
 			if os.IsNotExist(err) {
-				klog.Errorf("AttachDisk: VolumeID: %s, Path %s is not exist, so create one.", req.GetVolumeId(), req.GetTargetPath())
 				if err = os.MkdirAll(targetPath, 0750); err != nil {
-					return fmt.Errorf("create target path: %v", err)
+					return fmt.Errorf("failed to create target path %s: %w", targetPath, err)
 				}
 				notMounted = true
 			} else {
-				return fmt.Errorf("check target path %v", err)
+				return fmt.Errorf("cannot check if %s is mount point: %w", targetPath, err)
 			}
 		}
 		if !notMounted {
-			klog.Infof("AttachDisk: VolumeID: %s, Path: %s is already mounted.", req.GetVolumeId(), req.GetTargetPath())
+			klog.Infof("AttachDisk: %s is already mounted", targetPath)
 			return nil
 		}
 
-		fsType := req.GetVolumeCapability().GetMount().GetFsType()
-		readonly := req.GetReadonly()
-		mountOptions := req.GetVolumeCapability().GetMount().GetMountFlags()
-
-		options := []string{}
-		if readonly {
+		fsType := mountCap.GetFsType()
+		if fsType == "" {
+			fsType = "ext4" // default if not specified
+		}
+		mountOptions := mountCap.GetMountFlags()
+		options := append([]string{}, mountOptions...)
+		if req.GetReadonly() {
 			options = append(options, "ro")
 		} else {
 			options = append(options, "rw")
 		}
-		options = append(options, mountOptions...)
 
-		if err = mounter.FormatAndMount(devicePath, targetPath, fsType, options); err != nil {
-			klog.Errorf("AttachDisk: failed to mount Device %s to %s with options: %v", devicePath, targetPath, options)
-			return fmt.Errorf("failed to mount Device %s to %s with options: %v", devicePath, targetPath, options)
+		if err = safeMounter.FormatAndMount(devicePath, targetPath, fsType, options); err != nil {
+			return fmt.Errorf("failed to format and mount device %s to %s: %w", devicePath, targetPath, err)
 		}
+
+		klog.Infof("AttachDisk: Successfully mounted filesystem device %s to %s", devicePath, targetPath)
+		return nil
 	}
 
-	klog.Infof("AttachDisk: Successfully Attach Device %s to %s", devicePath, targetPath)
-	return nil
+	return fmt.Errorf("unsupported volume capability")
 }
 
-// DetachDisk performs unmount and cleanup of the target path.
-// This is a generic helper for NVMe device unmounts (both block bind and filesystem mounts).
-func DetachDisk(targetPath string) (err error) {
-	mounter := &mount.SafeFormatAndMount{Interface: mount.New(""), Exec: exec.New()}
+// DetachDisk performs unmount and cleanup of the target path (handles both block and filesystem cases).
+func DetachDisk(targetPath string) error {
+	mounter := mount.New("")
+	safeMounter := &mount.SafeFormatAndMount{
+		Interface: mounter,
+		Exec:      exec.New(),
+	}
 
-	notMnt, err := mount.IsNotMountPoint(mounter, targetPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("check target path error: %w", err)
-		}
-	} else if !notMnt {
-		if err = mounter.Unmount(targetPath); err != nil {
-			klog.Errorf("nvmf detach disk: failed to unmount: %s\nError: %v", targetPath, err)
-			return err
+	// Handle raw block case
+	blockFile := filepath.Join(targetPath, blockRawFileName)
+	if _, err := os.Lstat(blockFile); err == nil {
+		// Placeholder file exists
+		isNotMountPoint, checkErr := mounter.IsLikelyNotMountPoint(blockFile)
+		if checkErr == nil && !isNotMountPoint {
+			// It is mounted → unmount the bind
+			if umErr := mounter.Unmount(blockFile); umErr != nil {
+				klog.Errorf("failed to unmount block file %s: %v", blockFile, umErr)
+				// Continue to cleanup anyway (best-effort)
+			}
 		}
 
-		// Delete the mount point (safe for both block file and directory)
-		if err = os.RemoveAll(targetPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed to remove target path: %w", err)
+		// Remove the placeholder file
+		if rmErr := os.Remove(blockFile); rmErr != nil {
+			klog.Errorf("failed to remove block file %s: %v", blockFile, rmErr)
 		}
 	}
 
+	// Handle filesystem case
+	if isNotMountPoint, err := safeMounter.IsLikelyNotMountPoint(targetPath); err == nil && !isNotMountPoint {
+		if umErr := safeMounter.Unmount(targetPath); umErr != nil {
+			klog.Errorf("failed to unmount filesystem target %s: %v", targetPath, umErr)
+			// Continue to cleanup (best-effort)
+		}
+	}
+
+	// Remove the publish directory (safe if already gone)
+	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		klog.Errorf("failed to remove publish directory %s: %v", targetPath, err)
+	}
+
+	klog.V(4).Infof("DetachDisk: successfully cleaned up %s", targetPath)
 	return nil
 }
