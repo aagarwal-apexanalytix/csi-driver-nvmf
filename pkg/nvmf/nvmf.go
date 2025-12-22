@@ -23,10 +23,6 @@ import (
 	"k8s.io/utils/mount"
 )
 
-const (
-	blockRawFileName = "volume"
-)
-
 type nvmfDiskInfo struct {
 	VolName   string
 	Nqn       string
@@ -39,7 +35,6 @@ type nvmfDiskInfo struct {
 }
 
 // getNVMfDiskInfo extracts NVMe-oF connection parameters from the volume context.
-// This is used for all volumes (only NVMe-oF provisioned volumes are supported).
 func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 	volName := req.GetVolumeId()
 	volOpts := req.GetVolumeContext()
@@ -96,41 +91,40 @@ func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 
 	if block := req.GetVolumeCapability().GetBlock(); block != nil {
 		// ==== Raw block volume ====
-		if err := os.MkdirAll(targetPath, 0755); err != nil {
-			return fmt.Errorf("failed to create publish directory %s: %w", targetPath, err)
+		// Ensure parent directory exists
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return fmt.Errorf("failed to create parent dir for target %s: %w", targetPath, err)
 		}
 
-		blockFile := filepath.Join(targetPath, blockRawFileName)
-
-		// Check if already published correctly (bind-mount exists and is a device)
-		if fi, err := os.Lstat(blockFile); err == nil {
+		// Check if already published correctly (target_path is a bind-mounted device)
+		if fi, err := os.Lstat(targetPath); err == nil {
 			if (fi.Mode() & os.ModeDevice) != 0 {
-				klog.V(4).Infof("AttachDisk: raw block already published correctly at %s", blockFile)
+				klog.V(4).Infof("AttachDisk: raw block already published at %s", targetPath)
 				return nil
 			}
 		}
 
-		// Create placeholder file if missing
-		if _, err := os.Stat(blockFile); os.IsNotExist(err) {
-			f, createErr := os.OpenFile(blockFile, os.O_CREATE|os.O_WRONLY, 0660)
+		// Create placeholder file if missing (target_path itself is the placeholder)
+		if _, err := os.Stat(targetPath); os.IsNotExist(err) {
+			f, createErr := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY, 0660)
 			if createErr != nil {
-				return fmt.Errorf("failed to create block placeholder file %s: %w", blockFile, createErr)
+				return fmt.Errorf("failed to create block placeholder file %s: %w", targetPath, createErr)
 			}
 			f.Close()
 		}
 
-		// Bind-mount the device to the placeholder file
+		// Bind-mount the device directly to target_path (the file)
 		mountOptions := []string{"bind"}
 		if req.GetReadonly() {
 			mountOptions = append(mountOptions, "ro")
 		}
-		if err := mounter.Mount(devicePath, blockFile, "", mountOptions); err != nil {
+		if err := mounter.Mount(devicePath, targetPath, "", mountOptions); err != nil {
 			// Cleanup placeholder on failure
-			_ = os.Remove(blockFile)
-			return fmt.Errorf("failed to bind-mount device %s to %s: %w", devicePath, blockFile, err)
+			_ = os.Remove(targetPath)
+			return fmt.Errorf("failed to bind-mount device %s to %s: %w", devicePath, targetPath, err)
 		}
 
-		klog.Infof("AttachDisk: Successfully published raw block device %s to %s", devicePath, blockFile)
+		klog.Infof("AttachDisk: Successfully published raw block device %s to %s", devicePath, targetPath)
 		return nil
 	}
 
@@ -183,22 +177,17 @@ func DetachDisk(targetPath string) error {
 		Exec:      exec.New(),
 	}
 
-	// Handle raw block case
-	blockFile := filepath.Join(targetPath, blockRawFileName)
-	if _, err := os.Lstat(blockFile); err == nil {
-		// Placeholder file exists
-		isNotMountPoint, checkErr := mounter.IsLikelyNotMountPoint(blockFile)
+	// Handle raw block case (target_path is the bind-mounted file)
+	if _, err := os.Lstat(targetPath); err == nil {
+		isNotMountPoint, checkErr := mounter.IsLikelyNotMountPoint(targetPath)
 		if checkErr == nil && !isNotMountPoint {
-			// It is mounted → unmount the bind
-			if umErr := mounter.Unmount(blockFile); umErr != nil {
-				klog.Errorf("failed to unmount block file %s: %v", blockFile, umErr)
-				// Continue to cleanup anyway (best-effort)
+			if umErr := mounter.Unmount(targetPath); umErr != nil {
+				klog.Errorf("failed to unmount block file %s: %v", targetPath, umErr)
 			}
 		}
 
-		// Remove the placeholder file
-		if rmErr := os.Remove(blockFile); rmErr != nil {
-			klog.Errorf("failed to remove block file %s: %v", blockFile, rmErr)
+		if rmErr := os.Remove(targetPath); rmErr != nil {
+			klog.Errorf("failed to remove block file %s: %v", targetPath, rmErr)
 		}
 	}
 
@@ -206,13 +195,13 @@ func DetachDisk(targetPath string) error {
 	if isNotMountPoint, err := safeMounter.IsLikelyNotMountPoint(targetPath); err == nil && !isNotMountPoint {
 		if umErr := safeMounter.Unmount(targetPath); umErr != nil {
 			klog.Errorf("failed to unmount filesystem target %s: %v", targetPath, umErr)
-			// Continue to cleanup (best-effort)
 		}
 	}
 
-	// Remove the publish directory (safe if already gone)
-	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
-		klog.Errorf("failed to remove publish directory %s: %v", targetPath, err)
+	// Remove parent publish directory if empty (best-effort)
+	parentDir := filepath.Dir(targetPath)
+	if err := os.Remove(parentDir); err != nil && !os.IsNotExist(err) {
+		klog.V(5).Infof("publish directory %s not removed (may not be empty): %v", parentDir, err)
 	}
 
 	klog.V(4).Infof("DetachDisk: successfully cleaned up %s", targetPath)
