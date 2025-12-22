@@ -33,6 +33,7 @@ import (
 )
 
 type NodeServer struct {
+	csi.UnimplementedNodeServer
 	Driver  *driver
 	mounter mount.Interface
 }
