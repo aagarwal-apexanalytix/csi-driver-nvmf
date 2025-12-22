@@ -76,7 +76,7 @@ func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabi
 	}, nil
 }
 
-func (n *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+func (n *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")

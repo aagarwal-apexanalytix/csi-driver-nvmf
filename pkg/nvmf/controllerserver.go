@@ -218,6 +218,19 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	actualBytes := int64(giBFloat) * 1024 * 1024 * 1024
 
 	params := req.Parameters
+
+	fstype := params["csi.storage.k8s.io/fstype"]
+	if fstype == "" {
+		fstype = params["fstype"] // optional non-standard fallback
+	}
+	if fstype == "" {
+		fstype = "ext4" // default to match existing node behavior
+	}
+
+	if fstype != "ext4" && fstype != "xfs" {
+		klog.Warningf("Requested fstype %q is not explicitly supported by online resize logic (supported: ext4, xfs)", fstype)
+	}
+
 	targetAddr, ok := params["targetAddr"]
 	if !ok || targetAddr == "" {
 		return nil, status.Error(codes.InvalidArgument, "targetAddr is required in StorageClass parameters")
@@ -308,11 +321,12 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 				VolumeId:      volumeID,
 				CapacityBytes: currentSize,
 				VolumeContext: map[string]string{
-					"targetTrAddr": targetAddr,
-					"targetTrPort": targetPort,
-					"targetTrType": "tcp",
-					"nqn":          slot,
-					"deviceID":     slot,
+					"targetTrAddr":              targetAddr,
+					"targetTrPort":              targetPort,
+					"targetTrType":              "tcp",
+					"nqn":                       slot,
+					"deviceID":                  slot,
+					"csi.storage.k8s.io/fstype": fstype,
 				},
 			},
 		}, nil
@@ -339,17 +353,17 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 					klog.V(4).Infof("Added comment to existing disk %s: %s", diskID, comment)
 				}
 			}
-
 			return &csi.CreateVolumeResponse{
 				Volume: &csi.Volume{
 					VolumeId:      volumeID,
 					CapacityBytes: currentSize,
 					VolumeContext: map[string]string{
-						"targetTrAddr": targetAddr,
-						"targetTrPort": targetPort,
-						"targetTrType": "tcp",
-						"nqn":          slot,
-						"deviceID":     slot,
+						"targetTrAddr":              targetAddr,
+						"targetTrPort":              targetPort,
+						"targetTrType":              "tcp",
+						"nqn":                       slot,
+						"deviceID":                  slot,
+						"csi.storage.k8s.io/fstype": fstype,
 					},
 				},
 			}, nil
@@ -429,11 +443,12 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			VolumeId:      volumeID,
 			CapacityBytes: actualBytes,
 			VolumeContext: map[string]string{
-				"targetTrAddr": targetAddr,
-				"targetTrPort": targetPort,
-				"targetTrType": "tcp",
-				"nqn":          slot,
-				"deviceID":     slot,
+				"targetTrAddr":              targetAddr,
+				"targetTrPort":              targetPort,
+				"targetTrType":              "tcp",
+				"nqn":                       slot,
+				"deviceID":                  slot,
+				"csi.storage.k8s.io/fstype": fstype,
 			},
 		},
 	}, nil
@@ -649,13 +664,13 @@ func (cs *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *c
 	}
 	klog.V(5).Infof("ValidateVolumeCapabilities requested for volume %s with %d capabilities", req.VolumeId, len(req.VolumeCapabilities))
 	supported := true
-	for _, cap := range req.VolumeCapabilities {
-		if cap.GetBlock() == nil && cap.GetMount() == nil {
+	for _, capability := range req.VolumeCapabilities {
+		if capability.GetBlock() == nil && capability.GetMount() == nil {
 			supported = false
 			continue
 		}
-		mode := cap.GetAccessMode().GetMode()
-		if cap.GetBlock() != nil {
+		mode := capability.GetAccessMode().GetMode()
+		if capability.GetBlock() != nil {
 			if mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER &&
 				mode != csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER &&
 				mode != csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER {

@@ -80,50 +80,38 @@ func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 	targetPath := req.GetTargetPath()
 	mounter := mount.New("")
-	safeMounter := &mount.SafeFormatAndMount{
-		Interface: mounter,
-		Exec:      exec.New(),
-	}
+	safeMounter := &mount.SafeFormatAndMount{Interface: mounter, Exec: exec.New()}
 
 	if req.GetVolumeCapability() == nil {
 		return fmt.Errorf("volume capability missing in request")
 	}
 
 	if block := req.GetVolumeCapability().GetBlock(); block != nil {
-		// ==== Raw block volume ====
-		// Ensure parent directory exists
+		// ==== Raw block volume ==== (unchanged)
 		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
 			return fmt.Errorf("failed to create parent dir for target %s: %w", targetPath, err)
 		}
-
-		// Check if already published correctly (target_path is a bind-mounted device)
 		if fi, err := os.Lstat(targetPath); err == nil {
 			if (fi.Mode() & os.ModeDevice) != 0 {
 				klog.V(4).Infof("AttachDisk: raw block already published at %s", targetPath)
 				return nil
 			}
 		}
-
-		// Create placeholder file if missing (target_path itself is the placeholder)
 		if _, err := os.Stat(targetPath); os.IsNotExist(err) {
 			f, createErr := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY, 0660)
 			if createErr != nil {
 				return fmt.Errorf("failed to create block placeholder file %s: %w", targetPath, createErr)
 			}
-			f.Close()
+			_ = f.Close()
 		}
-
-		// Bind-mount the device directly to target_path (the file)
 		mountOptions := []string{"bind"}
 		if req.GetReadonly() {
 			mountOptions = append(mountOptions, "ro")
 		}
 		if err := mounter.Mount(devicePath, targetPath, "", mountOptions); err != nil {
-			// Cleanup placeholder on failure
 			_ = os.Remove(targetPath)
 			return fmt.Errorf("failed to bind-mount device %s to %s: %w", devicePath, targetPath, err)
 		}
-
 		klog.Infof("AttachDisk: Successfully published raw block device %s to %s", devicePath, targetPath)
 		return nil
 	}
@@ -146,10 +134,18 @@ func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 			return nil
 		}
 
-		fsType := mountCap.GetFsType()
+		fsType := req.VolumeContext["csi.storage.k8s.io/fstype"] // StorageClass (provision-time)
 		if fsType == "" {
-			fsType = "ext4" // default if not specified
+			fsType = mountCap.GetFsType() // Pod volume spec (runtime override)
 		}
+		if fsType == "" {
+			fsType = "ext4"
+		}
+
+		if fsType != "ext4" && fsType != "xfs" {
+			klog.Warningf("Unsupported fstype %q for volume %s (online resize may fail)", fsType, req.GetVolumeId())
+		}
+
 		mountOptions := mountCap.GetMountFlags()
 		options := append([]string{}, mountOptions...)
 		if req.GetReadonly() {
