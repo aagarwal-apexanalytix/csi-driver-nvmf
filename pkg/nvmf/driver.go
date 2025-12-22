@@ -13,6 +13,9 @@ limitations under the License.
 package nvmf
 
 import (
+	"os"
+	"strings"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -34,12 +37,20 @@ type driver struct {
 
 // NewDriver creates the identity/node/controller servers
 func NewDriver(conf *GlobalConfig) *driver {
-	if conf.DriverName == "" {
-		klog.Fatalf("driverName not been specified")
-		return nil
+	if conf == nil {
+		klog.Fatal("GlobalConfig must be provided")
 	}
 
-	klog.Infof("Driver: %v version: %v", conf.DriverName, conf.Version)
+	if conf.DriverName == "" {
+		klog.Fatal("DriverName must be specified")
+	}
+
+	if conf.NodeID == "" {
+		klog.Fatal("NodeID must be specified")
+	}
+
+	klog.Infof("Initializing CSI driver: %s version: %s nodeID: %s",
+		conf.DriverName, conf.Version, conf.NodeID)
 
 	return &driver{
 		name:         conf.DriverName,
@@ -51,12 +62,45 @@ func NewDriver(conf *GlobalConfig) *driver {
 }
 
 func (d *driver) Run(conf *GlobalConfig) {
-	d.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{})
+	if conf.Endpoint == "" {
+		klog.Fatal("Endpoint must be specified")
+	}
+
+	// Create volume map directory if configured (used for persisting NVMe connection info)
+	if d.volumeMapDir != "" {
+		if err := os.MkdirAll(d.volumeMapDir, 0755); err != nil {
+			klog.Fatalf("Failed to create volume map directory %s: %v", d.volumeMapDir, err)
+		}
+		klog.V(4).Infof("Volume map directory ensured: %s", d.volumeMapDir)
+	}
+
 	d.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
 		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
 	})
+
+	if conf.IsControllerServer {
+		caps := []csi.ControllerServiceCapability_RPC_Type{
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+			csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
+			csi.ControllerServiceCapability_RPC_GET_CAPACITY,
+			csi.ControllerServiceCapability_RPC_GET_VOLUME,
+		}
+
+		// Conditional capabilities based on provider (static vs dynamic/MikroTik)
+		provider := strings.ToLower(os.Getenv("CSI_PROVIDER"))
+		if provider != "static" {
+			caps = append(caps,
+				csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
+				csi.ControllerServiceCapability_RPC_MODIFY_VOLUME,
+				csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
+				csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
+			)
+		}
+
+		d.AddControllerServiceCapabilities(caps)
+	}
 
 	d.idServer = NewIdentityServer(d)
 	d.nodeServer = NewNodeServer(d)
@@ -65,7 +109,8 @@ func (d *driver) Run(conf *GlobalConfig) {
 		d.controllerServer = NewControllerServer(d)
 	}
 
-	klog.Infof("Starting csi-plugin Driver: %v", d.name)
+	klog.Infof("Starting CSI driver: name=%s version=%s nodeID=%s endpoint=%s controller=%t volumeMapDir=%s",
+		d.name, d.version, d.nodeId, conf.Endpoint, conf.IsControllerServer, d.volumeMapDir)
 
 	s := NewNonBlockingGRPCServer()
 	s.Start(conf.Endpoint, d.idServer, d.controllerServer, d.nodeServer)
@@ -73,13 +118,13 @@ func (d *driver) Run(conf *GlobalConfig) {
 }
 
 func (d *driver) AddVolumeCapabilityAccessModes(caps []csi.VolumeCapability_AccessMode_Mode) []*csi.VolumeCapability_AccessMode {
-	var cap []*csi.VolumeCapability_AccessMode
+	var out []*csi.VolumeCapability_AccessMode
 	for _, c := range caps {
 		klog.Infof("Enabling volume access mode: %v", c.String())
-		cap = append(cap, &csi.VolumeCapability_AccessMode{Mode: c})
+		out = append(out, &csi.VolumeCapability_AccessMode{Mode: c})
 	}
-	d.cap = cap
-	return cap
+	d.cap = out
+	return out
 }
 
 func (d *driver) AddControllerServiceCapabilities(cl []csi.ControllerServiceCapability_RPC_Type) {
@@ -106,5 +151,5 @@ func (d *driver) ValidateControllerServiceRequest(c csi.ControllerServiceCapabil
 			return nil
 		}
 	}
-	return status.Error(codes.InvalidArgument, c.String())
+	return status.Errorf(codes.InvalidArgument, "unsupported controller service capability: %s", c.String())
 }
