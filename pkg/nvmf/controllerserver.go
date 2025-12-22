@@ -199,13 +199,11 @@ func (cs *ControllerServer) volumeExists(volumeID, restURL, username, password s
 
 func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	cs.initConfig()
-	klog.V(4).Infof("CreateVolume requested: name=%s, capacityRange=%v, parameters=%v, contentSource=%v",
-		req.GetName(), req.CapacityRange, req.Parameters, req.VolumeContentSource)
+	klog.V(4).Infof("CreateVolume requested: name=%s, capacityRange=%v, parameters=%v, contentSource=%v", req.GetName(), req.CapacityRange, req.Parameters, req.VolumeContentSource)
 
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume name required")
 	}
-
 	if req.GetVolumeContentSource() != nil {
 		return nil, status.Errorf(codes.Unimplemented, "volume content source (from snapshot or volume clone) is not supported")
 	}
@@ -214,7 +212,6 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if capBytes == 0 || capBytes < minVolumeSize {
 		capBytes = minVolumeSize
 	}
-
 	// Round up to the next full GiB
 	giBFloat := math.Ceil(float64(capBytes) / (1024.0 * 1024.0 * 1024.0))
 	sizeGiB := fmt.Sprintf("%dG", int64(giBFloat))
@@ -268,6 +265,15 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 
 	klog.V(4).Infof("Using MikroTik REST API: url=%s, username=%s (per-SC with global fallback)", localRestURL, localUsername)
 
+	// Extract PVC namespace from standard CSI provisioner parameters
+	pvcNamespace := params["csi.storage.k8s.io/pvc/namespace"]
+	if pvcNamespace == "" {
+		klog.Warningf("PVC namespace not found in parameters (csi.storage.k8s.io/pvc/namespace missing)")
+		pvcNamespace = "unknown"
+	}
+	pvcName := req.Name
+	comment := fmt.Sprintf("k8s-pvc:%s/%s", pvcNamespace, pvcName)
+
 	if cs.provider == ProviderStatic {
 		exists, currentSize, _ := cs.volumeExists(volumeID, cs.restURL, cs.username, cs.password)
 		if !exists {
@@ -299,6 +305,20 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if exists {
 		if currentSize >= actualBytes {
 			klog.V(4).Infof("Volume %s already exists with sufficient size (%d >= %d bytes)", volumeID, currentSize, actualBytes)
+
+			// Best-effort: add comment if disk exists (for idempotent case)
+			if diskID, getErr := cs.getDiskID(slot, localRestURL, localUsername, localPassword); getErr == nil {
+				commentData := map[string]string{
+					"numbers": diskID,
+					"comment": comment,
+				}
+				if setErr := cs.restPost("/disk/set", commentData, localRestURL, localUsername, localPassword); setErr != nil {
+					klog.Warningf("Failed to set comment on existing disk %s: %v (non-critical)", diskID, setErr)
+				} else {
+					klog.V(4).Infof("Added comment to existing disk %s: %s", diskID, comment)
+				}
+			}
+
 			return &csi.CreateVolumeResponse{
 				Volume: &csi.Volume{
 					VolumeId:      volumeID,
@@ -369,6 +389,17 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
 			return nil, status.Errorf(codes.Internal, "Export enable failed (PATCH .id: %v, SET .id: %v)", err, err2)
 		}
+	}
+
+	// Add descriptive comment with namespace/pvc-name
+	commentData := map[string]string{
+		"numbers": diskID,
+		"comment": comment,
+	}
+	if setErr := cs.restPost("/disk/set", commentData, localRestURL, localUsername, localPassword); setErr != nil {
+		klog.Warningf("Failed to set comment on disk %s: %v (non-critical)", diskID, setErr)
+	} else {
+		klog.V(4).Infof("Added comment to disk %s: %s", diskID, comment)
 	}
 
 	klog.V(4).Infof("Successfully created volume %s (actual size %d bytes)", volumeID, actualBytes)
