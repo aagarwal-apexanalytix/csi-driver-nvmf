@@ -15,6 +15,8 @@ limitations under the License.
 package nvmf
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -22,9 +24,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-driver-nvmf/pkg/utils"
 	"golang.org/x/net/context"
+
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
@@ -46,9 +49,17 @@ func NewNodeServer(d *driver) *NodeServer {
 }
 
 func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	klog.Infof("Using Nvme NodeGetCapabilities")
+	klog.V(4).Infof("NodeGetCapabilities called")
+
 	return &csi.NodeGetCapabilitiesResponse{
 		Capabilities: []*csi.NodeServiceCapability{
+			{
+				Type: &csi.NodeServiceCapability_Rpc{
+					Rpc: &csi.NodeServiceCapability_RPC{
+						Type: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+					},
+				},
+			},
 			{
 				Type: &csi.NodeServiceCapability_Rpc{
 					Rpc: &csi.NodeServiceCapability_RPC{
@@ -67,168 +78,244 @@ func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabi
 	}, nil
 }
 
-func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	// Pre-checks
+// getNVMfInfo extracts connection info from volume context
+func getNVMfInfo(volumeID string, volContext map[string]string) (*nvmfDiskInfo, error) {
+	targetTrAddr := volContext["targetTrAddr"]
+	targetTrPort := volContext["targetTrPort"]
+	targetTrType := volContext["targetTrType"]
+	devHostNqn := volContext["hostNqn"]
+	devHostId := volContext["hostId"]
+	deviceID := volContext["deviceID"]
+
+	if volContext["deviceUUID"] != "" {
+		if deviceID != "" {
+			klog.Warningf("Warning: deviceUUID is overwriting already defined deviceID, volID: %s", volumeID)
+		}
+		deviceID = strings.Join([]string{"uuid", volContext["deviceUUID"]}, ".")
+	}
+	if volContext["deviceEUI"] != "" {
+		if deviceID != "" {
+			klog.Warningf("Warning: deviceEUI is overwriting already defined deviceID, volID: %s", volumeID)
+		}
+		deviceID = strings.Join([]string{"eui", volContext["deviceEUI"]}, ".")
+	}
+
+	nqn := volContext["nqn"]
+
+	if targetTrAddr == "" || nqn == "" || targetTrPort == "" || targetTrType == "" || deviceID == "" {
+		return nil, fmt.Errorf("some nvme target info is missing, volID: %s", volumeID)
+	}
+
+	if targetTrPort == "" {
+		targetTrPort = defaultTargetPort
+	}
+
+	return &nvmfDiskInfo{
+		VolName:   volumeID,
+		Addr:      targetTrAddr,
+		Port:      targetTrPort,
+		Nqn:       nqn,
+		DeviceID:  deviceID,
+		Transport: targetTrType,
+		HostNqn:   devHostNqn,
+		HostId:    devHostId,
+	}, nil
+}
+
+func (n *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	}
+
 	if req.GetVolumeCapability() == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing Volume Capability")
+		return nil, status.Error(codes.InvalidArgument, "Volume Capability missing in request")
+	}
+
+	diskInfo, err := getNVMfInfo(volumeID, req.GetVolumeContext())
+	if err != nil {
+		return nil, err
+	}
+
+	klog.V(4).Infof("NodeStageVolume: connecting volume %s (addr=%s, port=%s, nqn=%s)", volumeID, diskInfo.Addr, diskInfo.Port, diskInfo.Nqn)
+
+	connector := getNvmfConnector(diskInfo)
+
+	devicePath, err := connector.Connect()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to connect volume %s: %v", volumeID, err)
+	}
+	if devicePath == "" {
+		return nil, status.Errorf(codes.Internal, "connect succeeded but returned empty device path for volume %s", volumeID)
+	}
+
+	klog.V(4).Infof("NodeStageVolume: volume %s connected at device %s", volumeID, devicePath)
+
+	// Persist connector info
+	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
+	if err := persistConnectorFile(connector, connectorFilePath); err != nil {
+		_ = connector.Disconnect()
+		removeConnectorFile(connectorFilePath)
+		return nil, status.Errorf(codes.Internal, "failed to persist connector for volume %s: %v", volumeID, err)
+	}
+
+	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+func (n *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
+	}
+
+	klog.V(4).Infof("NodeUnstageVolume: disconnecting volume %s", volumeID)
+
+	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
+	connector, err := GetConnectorFromFile(connectorFilePath)
+	if err == nil {
+		_ = connector.Disconnect()
+		removeConnectorFile(connectorFilePath)
+		klog.V(4).Infof("NodeUnstageVolume: disconnected and cleaned up persisted info for volume %s", volumeID)
+	} else {
+		klog.V(5).Infof("NodeUnstageVolume: no persisted connector found for volume %s (already cleaned)", volumeID)
+	}
+
+	return &csi.NodeUnstageVolumeResponse{}, nil
+}
+
+func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	if req.GetVolumeCapability() == nil {
+		return nil, status.Error(codes.InvalidArgument, "Volume Capability missing in request")
 	}
 	if len(req.GetVolumeId()) == 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing VolumeID")
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
 	if len(req.GetTargetPath()) == 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "NodePublishVolume missing TargetPath")
+		return nil, status.Error(codes.InvalidArgument, "Target Path missing in request")
 	}
 
 	volumeID := req.GetVolumeId()
 	targetPath := req.GetTargetPath()
 
-	klog.Infof("NodePublishVolume: VolumeID %s publish to targetPath %s.", volumeID, targetPath)
+	klog.V(4).Infof("NodePublishVolume: volume %s to target %s", volumeID, targetPath)
 
-	klog.V(4).Infof("NodePublishVolume: NVMe mode for volume %s", volumeID)
+	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
 
-	// Connect remote disk (idempotent if already connected with same parameters)
-	nvmfInfo, err := getNVMfDiskInfo(req)
+	var devicePath string
+	var connector *Connector
+
+	// Prefer persisted connector from staging
+	connector, err := GetConnectorFromFile(connectorFilePath)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "NodePublishVolume: get NVMf disk info from req err: %v", err)
+		// Fallback to direct connect from volume context
+		klog.V(5).Infof("No persisted connector found for volume %s, falling back to direct connect", volumeID)
+		diskInfo, extractErr := getNVMfInfo(volumeID, req.GetVolumeContext())
+		if extractErr != nil {
+			return nil, extractErr
+		}
+		connector = getNvmfConnector(diskInfo)
 	}
 
-	connector := getNvmfConnector(nvmfInfo)
-	devicePath, err := connector.Connect()
+	devicePath, err = connector.Connect()
 	if err != nil {
-		klog.Errorf("VolumeID %s failed to connect, Error: %v", volumeID, err)
-		return nil, status.Errorf(codes.Internal, "VolumeID %s failed to connect, Error: %v", volumeID, err)
+		return nil, status.Errorf(codes.Internal, "failed to connect volume %s: %v", volumeID, err)
 	}
 	if devicePath == "" {
-		klog.Errorf("VolumeID %s connected, but return nil devicePath", volumeID)
-		return nil, status.Errorf(codes.Internal, "VolumeID %s connected, but return nil devicePath", volumeID)
-	}
-	klog.Infof("Volume %s successful connected, Device: %s", volumeID, devicePath)
-
-	// Persist new/updated connector (overwrites if exists)
-	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
-	err = persistConnectorFile(connector, connectorFilePath)
-	if err != nil {
-		klog.Errorf("failed to persist connection info: %v", err)
-		// Rollback connect
-		_ = connector.Disconnect()
-		removeConnectorFile(connectorFilePath)
-		return nil, status.Errorf(codes.Internal, "VolumeID %s persist connection info error: %v", volumeID, err)
+		return nil, status.Errorf(codes.Internal, "connect succeeded but empty device path for volume %s", volumeID)
 	}
 
-	// Validate access type
-	if req.GetVolumeCapability().GetBlock() != nil && req.GetVolumeCapability().GetMount() != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "cannot have both block and mount access type")
+	klog.V(4).Infof("NodePublishVolume: volume %s connected at device %s", volumeID, devicePath)
+
+	// Persist if fallback (non-critical)
+	if err := persistConnectorFile(connector, connectorFilePath); err != nil {
+		klog.Warningf("Failed to persist connector for volume %s (non-critical): %v", volumeID, err)
 	}
 
-	err = AttachDisk(req, devicePath)
-	if err != nil {
-		// Rollback on attach failure
-		_ = connector.Disconnect()
-		removeConnectorFile(connectorFilePath)
-		return nil, status.Errorf(codes.Internal, "VolumeID %s attach error: %v", volumeID, err)
+	if err := AttachDisk(req, devicePath); err != nil {
+		// Rollback only if fallback connect
+		if _, loadErr := GetConnectorFromFile(connectorFilePath); loadErr != nil {
+			_ = connector.Disconnect()
+			removeConnectorFile(connectorFilePath)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to attach disk for volume %s: %v", volumeID, err)
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
 func (n *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	klog.Infof("NodeUnpublishVolume: Starting unpublish volume %s at %s", req.VolumeId, req.TargetPath)
-
-	if req.VolumeId == "" {
-		return nil, status.Error(codes.InvalidArgument, "NodeUnpublishVolume VolumeID must be provided")
+	if len(req.VolumeId) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
-	if req.TargetPath == "" {
-		return nil, status.Error(codes.InvalidArgument, "NodeUnpublishVolume TargetPath must be provided")
+	if len(req.TargetPath) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Target Path missing in request")
 	}
 
 	targetPath := req.GetTargetPath()
 	volumeID := req.GetVolumeId()
 
-	// Always cleanup the target mount point
+	klog.V(4).Infof("NodeUnpublishVolume: unpublishing volume %s at %s", volumeID, targetPath)
+
 	if err := mount.CleanupMountPoint(targetPath, n.mounter, true); err != nil {
-		klog.Errorf("Failed to cleanup mount point %s: %v", targetPath, err)
-		return nil, status.Errorf(codes.Internal, "Failed to unpublish %s: %v", targetPath, err)
+		return nil, status.Errorf(codes.Internal, "failed to cleanup mount point %s: %v", targetPath, err)
 	}
 
-	// Disconnect NVMe subsystem if connector file exists
-	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
-	if connector, err := GetConnectorFromFile(connectorFilePath); err == nil {
-		_ = connector.Disconnect()
-		removeConnectorFile(connectorFilePath)
-		klog.V(4).Infof("Disconnected NVMe subsystem for volume %s", volumeID)
-	}
-
-	klog.Infof("NodeUnpublishVolume completed for volume %s", req.VolumeId)
+	klog.V(4).Infof("NodeUnpublishVolume: successfully unpublished volume %s", volumeID)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-func (n *NodeServer) NodeStageVolume(_ context.Context, _ *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	return &csi.NodeStageVolumeResponse{}, nil
-}
-
-func (n *NodeServer) NodeUnstageVolume(_ context.Context, _ *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	return &csi.NodeUnstageVolumeResponse{}, nil
+func getFSType(devicePath string) string {
+	exe := exec.New()
+	out, err := exe.Command("blkid", "-o", "value", "-s", "TYPE", devicePath).CombinedOutput()
+	if err != nil {
+		klog.V(5).Infof("blkid failed for %s: %v", devicePath, err)
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	if len(req.GetVolumeId()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
+
 	volumeID := req.VolumeId
-	klog.Infof("NodeExpandVolume called for volume %s with required bytes %d", volumeID, req.CapacityRange.GetRequiredBytes())
+	volumePath := req.GetVolumePath()
+	klog.V(4).Infof("NodeExpandVolume called for volume %s (volumePath=%s, requiredBytes=%d)", volumeID, volumePath, req.CapacityRange.GetRequiredBytes())
 
 	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
 
 	var devicePath string
 	var err error
 
-	// Primary attempt: find existing device
 	_, devicePath, err = getNvmeInfoByNqn(volumeID)
 	if err == nil && devicePath != "" {
-		klog.Infof("Found existing device %s for volume %s", devicePath, volumeID)
+		klog.V(4).Infof("Found existing device %s for volume %s", devicePath, volumeID)
 	} else {
-		klog.Warningf("Initial device lookup failed for volume %s: %v — attempting recovery via persisted connector", volumeID, err)
-
-		// Recovery: load persisted connector and reconnect
+		klog.V(4).Infof("Device lookup failed for volume %s, attempting recovery", volumeID)
 		connector, loadErr := GetConnectorFromFile(connectorFilePath)
 		if loadErr != nil {
-			klog.Errorf("Failed to load persisted connector for recovery: %v", loadErr)
-			return nil, status.Errorf(codes.Internal, "failed to find device for volume %s and recovery failed: %v", volumeID, err)
+			return nil, status.Errorf(codes.FailedPrecondition, "volume %s not connected and recovery failed", volumeID)
 		}
-
 		recoveredDevice, reconErr := connector.Connect()
-		if reconErr != nil {
-			klog.Errorf("Recovery reconnect failed for volume %s: %v", volumeID, reconErr)
-			return nil, status.Errorf(codes.Internal, "failed to recover connection for volume %s: %v", volumeID, reconErr)
+		if reconErr != nil || recoveredDevice == "" {
+			return nil, status.Errorf(codes.Internal, "recovery reconnect failed for volume %s", volumeID)
 		}
-		if recoveredDevice == "" {
-			klog.Errorf("Recovery reconnect succeeded but returned empty device path for volume %s", volumeID)
-			return nil, status.Errorf(codes.Internal, "recovery reconnect for volume %s returned empty device path", volumeID)
-		}
-
-		// Wait for device to appear
-		maxRetries := 30
-		for i := 0; i < maxRetries; i++ {
+		for i := 0; i < 30; i++ {
 			_, devicePath, err = getNvmeInfoByNqn(volumeID)
 			if err == nil && devicePath != "" {
-				klog.Infof("Recovery successful: device %s now available for volume %s", devicePath, volumeID)
 				break
 			}
 			time.Sleep(2 * time.Second)
 		}
 		if devicePath == "" {
-			klog.Errorf("Recovery failed: device still not found after reconnect for volume %s", volumeID)
-			return nil, status.Errorf(codes.Internal, "failed to recover device for volume %s after reconnect", volumeID)
+			return nil, status.Errorf(codes.Internal, "device not found after recovery for volume %s", volumeID)
 		}
 	}
 
-	// Rescan controllers (robust)
+	// Rescan controllers
 	const ctlPath = "/sys/class/nvme-fabrics/ctl"
-	entries, err := os.ReadDir(ctlPath)
-	if err != nil {
-		klog.Errorf("Failed to read %s during rescan: %v", ctlPath, err)
-	} else {
-		rescanTriggered := false
+	if entries, err := os.ReadDir(ctlPath); err == nil {
 		for _, entry := range entries {
 			if !strings.HasPrefix(entry.Name(), "nvme") {
 				continue
@@ -240,36 +327,43 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 			}
 			if strings.TrimSpace(string(data)) == volumeID {
 				scanPath := filepath.Join(ctlPath, entry.Name(), "rescan_controller")
-				klog.Infof("Triggering rescan at %s for volume %s", scanPath, volumeID)
 				if utils.IsFileExisting(scanPath) {
-					file, err := os.OpenFile(scanPath, os.O_WRONLY, 0666)
-					if err != nil {
-						klog.Errorf("Failed to open rescan path %s: %v", scanPath, err)
-					} else {
+					if file, err := os.OpenFile(scanPath, os.O_WRONLY, 0666); err == nil {
 						defer file.Close()
-						if _, err = file.WriteString("1"); err != nil {
-							klog.Errorf("Failed to trigger rescan on %s: %v", entry.Name(), err)
-						} else {
-							klog.Infof("Successfully triggered rescan for controller %s", entry.Name())
-							rescanTriggered = true
-						}
+						_, _ = file.WriteString("1")
+						klog.V(4).Infof("Triggered rescan for controller %s", entry.Name())
 					}
 				}
 			}
 		}
-		if !rescanTriggered {
-			klog.Warningf("No rescan paths found for volume %s (may already be updated)", volumeID)
-		}
 	}
 
-	// Online filesystem resize (assumes ext4)
-	klog.Infof("Running online resize2fs on %s for volume %s", devicePath, volumeID)
-	out, err := exec.New().Command("resize2fs", devicePath).CombinedOutput()
-	if err != nil {
-		klog.Errorf("resize2fs failed for %s: %v\nOutput: %s", devicePath, err, string(out))
-		return nil, status.Errorf(codes.Internal, "filesystem resize failed: %v\nOutput: %s", err, string(out))
+	// Online filesystem resize if mounted
+	if volumePath != "" {
+		if stat, err := os.Stat(volumePath); err == nil && stat.IsDir() {
+			fsType := getFSType(devicePath)
+			klog.V(4).Infof("Detected filesystem type '%s' on device %s", fsType, devicePath)
+
+			var out []byte
+			var cmdErr error
+			exe := exec.New()
+			if fsType == "xfs" {
+				out, cmdErr = exe.Command("xfs_growfs", volumePath).CombinedOutput()
+			} else if strings.HasPrefix(fsType, "ext") {
+				out, cmdErr = exe.Command("resize2fs", devicePath).CombinedOutput()
+			} else {
+				klog.V(5).Infof("No online resize attempted for filesystem type '%s'", fsType)
+			}
+
+			if cmdErr != nil {
+				klog.Errorf("Filesystem resize failed: %v\nOutput: %s", cmdErr, string(out))
+				return nil, status.Errorf(codes.Internal, "filesystem resize failed: %v", cmdErr)
+			}
+			if len(out) > 0 {
+				klog.V(4).Infof("Filesystem resize success: %s", string(out))
+			}
+		}
 	}
-	klog.Infof("resize2fs success: %s", string(out))
 
 	return &csi.NodeExpandVolumeResponse{
 		CapacityBytes: req.CapacityRange.GetRequiredBytes(),
@@ -277,8 +371,22 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 }
 
 func (n *NodeServer) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+	klog.V(5).Infof("NodeGetInfo called")
+
+	topology := &csi.Topology{
+		Segments: map[string]string{},
+	}
+	if zone := os.Getenv("CSI_NODE_ZONE"); zone != "" {
+		topology.Segments["topology.nvmf.csi/zone"] = zone
+	}
+	if region := os.Getenv("CSI_NODE_REGION"); region != "" {
+		topology.Segments["topology.nvmf.csi/region"] = region
+	}
+
 	return &csi.NodeGetInfoResponse{
-		NodeId: n.Driver.nodeId,
+		NodeId:             n.Driver.nodeId,
+		MaxVolumesPerNode:  0,
+		AccessibleTopology: topology,
 	}, nil
 }
 
@@ -290,6 +398,7 @@ func (n *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolum
 		return nil, status.Error(codes.InvalidArgument, "Volume path missing in request")
 	}
 
+	volumeID := req.VolumeId
 	volumePath := req.VolumePath
 
 	stat, err := os.Stat(volumePath)
@@ -300,39 +409,82 @@ func (n *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolum
 		return nil, status.Errorf(codes.Internal, "Failed to stat volume path %s: %v", volumePath, err)
 	}
 
-	if !stat.IsDir() {
-		klog.V(4).Infof("NodeGetVolumeStats: Volume %s is raw block (file), stats not supported", req.VolumeId)
-		return nil, status.Errorf(codes.Unimplemented, "NodeGetVolumeStats not supported for raw block volumes")
+	var usage []*csi.VolumeUsage
+	condition := &csi.VolumeCondition{
+		Abnormal: false,
+		Message:  "Volume is healthy",
 	}
 
-	var statfs syscall.Statfs_t
-	if err := syscall.Statfs(volumePath, &statfs); err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to get filesystem stats for %s: %v", volumePath, err)
+	// Check underlying NVMe device connection health
+	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
+	if _, err := os.Stat(connectorFilePath); err == nil {
+		// Persisted connector exists — verify device is still present
+		_, devicePath, lookupErr := getNvmeInfoByNqn(volumeID)
+		if lookupErr != nil || devicePath == "" {
+			condition.Abnormal = true
+			condition.Message = "Underlying NVMe device disconnected or unavailable"
+			klog.Warningf("Volume %s condition abnormal: device lookup failed (%v)", volumeID, lookupErr)
+		}
+	} else if !os.IsNotExist(err) {
+		klog.Warningf("Failed to stat persisted connector file for volume %s: %v", volumeID, err)
+	}
+	// If no persisted file, assume healthy (common for non-staged or legacy)
+
+	if stat.IsDir() {
+		// Filesystem stats
+		var statfs syscall.Statfs_t
+		if err := syscall.Statfs(volumePath, &statfs); err != nil {
+			// If stats fail but condition not already abnormal, mark it
+			if !condition.Abnormal {
+				condition.Abnormal = true
+				condition.Message = "Failed to retrieve filesystem statistics"
+			}
+			klog.Errorf("Failed to get filesystem stats for %s: %v", volumePath, err)
+		} else {
+			totalBytes := int64(statfs.Blocks * uint64(statfs.Bsize))
+			availableBytes := int64(statfs.Bfree * uint64(statfs.Bsize))
+			usedBytes := totalBytes - availableBytes
+			totalInodes := int64(statfs.Files)
+			freeInodes := int64(statfs.Ffree)
+			usedInodes := totalInodes - freeInodes
+
+			usage = []*csi.VolumeUsage{
+				{Unit: csi.VolumeUsage_BYTES, Total: totalBytes, Available: availableBytes, Used: usedBytes},
+				{Unit: csi.VolumeUsage_INODES, Total: totalInodes, Available: freeInodes, Used: usedInodes},
+			}
+		}
+	} else {
+		// Raw block volume stats (cross-platform fallback with Seek)
+		fd, err := os.Open(volumePath)
+		if err != nil {
+			if !condition.Abnormal {
+				condition.Abnormal = true
+				condition.Message = "Failed to open block device"
+			}
+			return nil, status.Errorf(codes.Internal, "Failed to open block device %s: %v", volumePath, err)
+		}
+		defer fd.Close()
+
+		size, seekErr := fd.Seek(0, io.SeekEnd)
+		if seekErr != nil || size == 0 {
+			if !condition.Abnormal {
+				condition.Abnormal = true
+				condition.Message = "Failed to determine block device size"
+			}
+			klog.Warningf("Seek failed or returned 0 for block device %s (err: %v)", volumePath, seekErr)
+			size = 0 // Report 0 if unknown
+		}
+		totalBytes := size
+
+		usage = []*csi.VolumeUsage{
+			{Unit: csi.VolumeUsage_BYTES, Total: totalBytes, Available: totalBytes, Used: 0},
+		}
 	}
 
-	totalBytes := int64(statfs.Blocks * uint64(statfs.Bsize))
-	availableBytes := int64(statfs.Bfree * uint64(statfs.Bsize))
-	usedBytes := totalBytes - availableBytes
-	totalInodes := int64(statfs.Files)
-	freeInodes := int64(statfs.Ffree)
-	usedInodes := totalInodes - freeInodes
-
-	klog.V(4).Infof("NodeGetVolumeStats for volume %s at %s: total=%d, available=%d, used=%d bytes; inodes total=%d, used=%d", req.VolumeId, volumePath, totalBytes, availableBytes, usedBytes, totalInodes, usedInodes)
-
+	klog.V(4).Infof("NodeGetVolumeStats for volume %s at %s completed (condition: abnormal=%v, message=%s)",
+		volumeID, volumePath, condition.Abnormal, condition.Message)
 	return &csi.NodeGetVolumeStatsResponse{
-		Usage: []*csi.VolumeUsage{
-			{
-				Unit:      csi.VolumeUsage_BYTES,
-				Total:     totalBytes,
-				Available: availableBytes,
-				Used:      usedBytes,
-			},
-			{
-				Unit:      csi.VolumeUsage_INODES,
-				Total:     totalInodes,
-				Available: freeInodes,
-				Used:      usedInodes,
-			},
-		},
+		Usage:           usage,
+		VolumeCondition: condition,
 	}, nil
 }
