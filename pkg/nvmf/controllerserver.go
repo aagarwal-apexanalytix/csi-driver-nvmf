@@ -939,6 +939,7 @@ func (cs *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.
 }
 
 func (cs *ControllerServer) ControllerModifyVolume(_ context.Context, req *csi.ControllerModifyVolumeRequest) (*csi.ControllerModifyVolumeResponse, error) {
+	cs.initConfig()
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
@@ -946,11 +947,43 @@ func (cs *ControllerServer) ControllerModifyVolume(_ context.Context, req *csi.C
 	if cs.provider == ProviderStatic {
 		return nil, status.Error(codes.Unimplemented, "ControllerModifyVolume not supported in static provider mode")
 	}
+
 	mutableParams := req.GetMutableParameters()
 	if len(mutableParams) == 0 {
 		klog.V(4).Infof("ControllerModifyVolume no-op success for volume %s (no mutable parameters provided)", volumeID)
 		return &csi.ControllerModifyVolumeResponse{}, nil
 	}
-	klog.V(4).Infof("ControllerModifyVolume rejected for volume %s: provided mutable parameters %v are not supported", volumeID, mutableParams)
-	return nil, status.Errorf(codes.InvalidArgument, "no mutable volume parameters are supported (provided: %v)", mutableParams)
+
+	klog.V(4).Infof("ControllerModifyVolume requested for volume %s with mutable parameters: %v", volumeID, mutableParams)
+
+	slot := volumeID
+	diskID, err := cs.getDiskID(slot, cs.restURL, cs.username, cs.password)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "Failed to locate disk for volume %s: %v", volumeID, err)
+	}
+
+	updated := false
+	for key, value := range mutableParams {
+		switch key {
+		case "comment":
+			commentData := map[string]string{
+				"numbers": diskID,
+				"comment": value,
+			}
+			if err := cs.restPost("/disk/set", commentData, cs.restURL, cs.username, cs.password); err != nil {
+				return nil, status.Errorf(codes.Internal, "Failed to update comment on disk %s: %v", diskID, err)
+			}
+			klog.V(4).Infof("Successfully updated comment on volume %s to: %s", volumeID, value)
+			updated = true
+
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "Unsupported mutable parameter %q (only 'comment' is currently supported)", key)
+		}
+	}
+
+	if !updated {
+		klog.V(4).Infof("No supported mutable parameters were applied for volume %s", volumeID)
+	}
+
+	return &csi.ControllerModifyVolumeResponse{}, nil
 }
