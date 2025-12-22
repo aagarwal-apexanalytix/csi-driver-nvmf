@@ -295,14 +295,11 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	// Handle content source (clone or restore from snapshot)
 	var parentSubvol string
 	var sourceCapacity int64
-	var sourceFileSizeStr string // Exact "file-size" from source disk
 	var cloneInfo string
 	if contentSource != nil {
 		if cs.provider == ProviderStatic {
 			return nil, status.Error(codes.Unimplemented, "Volume cloning/from-snapshot not supported in static mode")
 		}
-
-		var sourceVolID string
 
 		// Snapshot source
 		if snapSrc := contentSource.GetSnapshot(); snapSrc != nil {
@@ -310,9 +307,10 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			if snapID == "" {
 				return nil, status.Error(codes.InvalidArgument, "Snapshot ID missing")
 			}
-			parentSubvol = snapID
+			parentSubvol = snapID // snapshot subvol name is the ID
 			cloneInfo = fmt.Sprintf(" restored-from-snapshot:%s", snapID)
 
+			// Extract original volume ID to query its size
 			if !strings.HasPrefix(snapID, "snap-") {
 				return nil, status.Error(codes.InvalidArgument, "Invalid snapshot ID format")
 			}
@@ -321,42 +319,38 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			if lastDash == -1 {
 				return nil, status.Error(codes.InvalidArgument, "Invalid snapshot ID format (missing source volume)")
 			}
-			sourceVolID = temp[lastDash+1:]
+			sourceVol := temp[lastDash+1:]
+
+			exists, size, err := cs.volumeExists(sourceVol, localRestURL, localUsername, localPassword)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "Failed to query source volume size: %v", err)
+			}
+			if !exists {
+				return nil, status.Error(codes.NotFound, "Source volume for snapshot not found")
+			}
+			sourceCapacity = size
 
 			// Volume source (clone)
 		} else if volSrc := contentSource.GetVolume(); volSrc != nil {
-			sourceVolID = volSrc.GetVolumeId()
+			sourceVolID := volSrc.GetVolumeId()
 			if sourceVolID == "" {
 				return nil, status.Error(codes.InvalidArgument, "Source Volume ID missing")
 			}
 			parentSubvol = "vol-" + sourceVolID
 			cloneInfo = fmt.Sprintf(" cloned-from-volume:%s", sourceVolID)
+
+			exists, size, err := cs.volumeExists(sourceVolID, localRestURL, localUsername, localPassword)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "Failed to query source volume: %v", err)
+			}
+			if !exists {
+				return nil, status.Error(codes.NotFound, "Source volume not found")
+			}
+			sourceCapacity = size
+
+			// Unknown / invalid
 		} else {
 			return nil, status.Error(codes.Unimplemented, "Unknown or unsupported volume content source type")
-		}
-
-		// Query source disk to get exact file-size string
-		disks, err := cs.restGet("/disk", localRestURL, localUsername, localPassword)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "Failed to query source disk details: %v", err)
-		}
-		found := false
-		for _, d := range disks {
-			if s, ok := d["slot"].(string); ok && s == sourceVolID {
-				sourceFileSizeStr, _ = d["file-size"].(string)
-				if sourceFileSizeStr == "" {
-					sourceFileSizeStr, _ = d["size"].(string) // fallback
-				}
-				if sourceFileSizeStr == "" {
-					return nil, status.Error(codes.Internal, "Source disk missing file-size")
-				}
-				sourceCapacity = parseSizeToBytes(sourceFileSizeStr)
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, status.Error(codes.NotFound, "Source volume disk not found")
 		}
 
 		comment += cloneInfo
@@ -384,7 +378,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		}
 	}
 
-	// Round up to full GiB for new/grow
+	// Round up to full GiB
 	giBFloat := math.Ceil(float64(effectiveBytes) / (1024.0 * 1024.0 * 1024.0))
 	sizeGiB := fmt.Sprintf("%dG", int64(giBFloat))
 	actualBytes := int64(giBFloat) * 1024 * 1024 * 1024
@@ -421,6 +415,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	}
 	if exists {
 		if currentSize >= actualBytes {
+			// Best-effort update comment
 			if diskID, getErr := cs.getDiskID(slot, localRestURL, localUsername, localPassword); getErr == nil {
 				commentData := map[string]string{
 					"numbers": diskID,
@@ -452,16 +447,14 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	// Provision new volume
 	klog.V(4).Infof("Provisioning new volume %s (slot=%s, size=%s)%s", req.Name, slot, sizeGiB, cloneInfo)
 
-	// Create BTRFS subvolume
+	// Create BTRFS subvolume (empty or snapshot)
 	subvolData := map[string]string{
-		"fs":   backendDisk,
-		"name": subVolName,
+		"fs":        backendDisk,
+		"name":      subVolName,
+		"read-only": "no",
 	}
 	if parentSubvol != "" {
 		subvolData["parent"] = parentSubvol
-		if strings.HasPrefix(parentSubvol, "snap-") {
-			subvolData["read-only"] = "no"
-		}
 	}
 	err = cs.restPost("/disk/btrfs/subvolume/add", subvolData, localRestURL, localUsername, localPassword)
 	if err != nil {
@@ -472,50 +465,16 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		}
 	}
 
-	// Create file-backed disk — use exact source file-size for clones
+	// Create file-backed disk
 	diskData := map[string]string{
 		"type":      "file",
 		"file-path": imgPath,
+		"file-size": sizeGiB,
 		"slot":      slot,
-	}
-	if contentSource != nil {
-		if sourceFileSizeStr == "" {
-			return nil, status.Error(codes.Internal, "Source file-size empty")
-		}
-		diskData["file-size"] = sourceFileSizeStr // Exact to preserve data/FS
-	} else {
-		diskData["file-size"] = sizeGiB
 	}
 	if err := cs.restPost("/disk/add", diskData, localRestURL, localUsername, localPassword); err != nil {
 		_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
 		return nil, status.Errorf(codes.Internal, "Disk create failed: %v", err)
-	}
-
-	// Grow if requested larger (for clones or normal)
-	if actualBytes > sourceCapacity || contentSource == nil {
-		diskID, err := cs.getDiskID(slot, localRestURL, localUsername, localPassword)
-		if err != nil {
-			_ = cs.restDelete("/disk/"+slot, localRestURL, localUsername, localPassword)
-			_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
-			return nil, status.Errorf(codes.Internal, "Failed to get disk ID for resize: %v", err)
-		}
-		if actualBytes > sourceCapacity || contentSource == nil {
-			resizeData := map[string]string{"file-size": sizeGiB}
-			err = cs.restPatch("/disk/"+diskID, resizeData, localRestURL, localUsername, localPassword)
-			if err != nil {
-				klog.Warningf("PATCH resize failed, trying SET: %v", err)
-				setData := map[string]string{
-					"numbers":   diskID,
-					"file-size": sizeGiB,
-				}
-				if err2 := cs.restPost("/disk/set", setData, localRestURL, localUsername, localPassword); err2 != nil {
-					_ = cs.restDelete("/disk/"+diskID, localRestURL, localUsername, localPassword)
-					_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
-					return nil, status.Errorf(codes.Internal, "Resize failed: %v / %v", err, err2)
-				}
-			}
-			klog.V(4).Infof("Resized volume to %s", sizeGiB)
-		}
 	}
 
 	// Enable export
