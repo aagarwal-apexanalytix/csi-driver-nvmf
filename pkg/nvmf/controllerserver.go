@@ -272,7 +272,16 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		pvcNamespace = "unknown"
 	}
 	pvcName := req.Name
-	comment := fmt.Sprintf("k8s-pvc:%s/%s", pvcNamespace, pvcName)
+
+	// Extract cluster name from custom StorageClass parameter (fallback to "unknown")
+	clusterName := params["clusterName"]
+	if clusterName == "" {
+		klog.Warningf("Cluster name not provided in StorageClass parameters (clusterName missing)")
+		clusterName = "unknown"
+	}
+
+	// Build comment: cluster:namespace/pvc-name
+	comment := fmt.Sprintf("k8s-pvc:%s:%s/%s", clusterName, pvcNamespace, pvcName)
 
 	if cs.provider == ProviderStatic {
 		exists, currentSize, _ := cs.volumeExists(volumeID, cs.restURL, cs.username, cs.password)
@@ -391,7 +400,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		}
 	}
 
-	// Add descriptive comment with namespace/pvc-name
+	// Add descriptive comment with cluster:namespace/pvc-name
 	commentData := map[string]string{
 		"numbers": diskID,
 		"comment": comment,
