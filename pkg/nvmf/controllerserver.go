@@ -235,7 +235,37 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		backendMount = cs.backendMount
 	}
 
-	volumeID := strings.ReplaceAll(strings.ToLower(req.Name), "-", "")
+	// Extract standard injected CSI parameters (require provisioner with --extra-create-metadata=true)
+	pvcNamespace := params["csi.storage.k8s.io/pvc/namespace"]
+	pvcHumanName := params["csi.storage.k8s.io/pvc/name"]
+	pvName := params["csi.storage.k8s.io/pv/name"]
+
+	// Fallbacks with warnings
+	if pvcNamespace == "" {
+		klog.Warningf("PVC namespace param missing (csi.storage.k8s.io/pvc/namespace) - ensure csi-provisioner has --extra-create-metadata=true")
+		pvcNamespace = "unknown"
+	}
+	if pvcHumanName == "" {
+		klog.Warningf("PVC name param missing (csi.storage.k8s.io/pvc/name) - falling back to req.Name")
+		pvcHumanName = req.Name
+	}
+	if pvName == "" {
+		klog.Warningf("PV name param missing (csi.storage.k8s.io/pv/name) - falling back to req.Name")
+		pvName = req.Name
+	}
+
+	// Cluster name from custom StorageClass parameter (optional)
+	clusterName := params["clusterName"]
+	if clusterName == "" {
+		klog.V(5).Infof("clusterName StorageClass parameter not set - using 'unknown'")
+		clusterName = "unknown"
+	}
+
+	// Comment: cluster:namespace/pvc-name (pv:pv-name)
+	comment := fmt.Sprintf("k8s-pvc:%s:%s/%s (pv:%s)", clusterName, pvcNamespace, pvcHumanName, pvName)
+
+	// Use PV name for slot/volumeID (guaranteed unique)
+	volumeID := strings.ReplaceAll(strings.ToLower(pvName), "-", "")
 	slot := volumeID
 	subVolName := "vol-" + volumeID
 	imgPath := backendMount + "/" + subVolName + "/volume.img"
@@ -264,24 +294,6 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	}
 
 	klog.V(4).Infof("Using MikroTik REST API: url=%s, username=%s (per-SC with global fallback)", localRestURL, localUsername)
-
-	// Extract PVC namespace from standard CSI provisioner parameters
-	pvcNamespace := params["csi.storage.k8s.io/pvc/namespace"]
-	if pvcNamespace == "" {
-		klog.Warningf("PVC namespace not found in parameters (csi.storage.k8s.io/pvc/namespace missing)")
-		pvcNamespace = "unknown"
-	}
-	pvcName := req.Name
-
-	// Extract cluster name from custom StorageClass parameter (fallback to "unknown")
-	clusterName := params["clusterName"]
-	if clusterName == "" {
-		klog.Warningf("Cluster name not provided in StorageClass parameters (clusterName missing)")
-		clusterName = "unknown"
-	}
-
-	// Build comment: cluster:namespace/pvc-name
-	comment := fmt.Sprintf("k8s-pvc:%s:%s/%s", clusterName, pvcNamespace, pvcName)
 
 	if cs.provider == ProviderStatic {
 		exists, currentSize, _ := cs.volumeExists(volumeID, cs.restURL, cs.username, cs.password)
@@ -315,7 +327,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		if currentSize >= actualBytes {
 			klog.V(4).Infof("Volume %s already exists with sufficient size (%d >= %d bytes)", volumeID, currentSize, actualBytes)
 
-			// Best-effort: add comment if disk exists (for idempotent case)
+			// Best-effort: add/update comment on existing disk
 			if diskID, getErr := cs.getDiskID(slot, localRestURL, localUsername, localPassword); getErr == nil {
 				commentData := map[string]string{
 					"numbers": diskID,
