@@ -2,7 +2,9 @@
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
+
     http://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -40,18 +42,13 @@ func NewDriver(conf *GlobalConfig) *driver {
 	if conf == nil {
 		klog.Fatal("GlobalConfig must be provided")
 	}
-
 	if conf.DriverName == "" {
 		klog.Fatal("DriverName must be specified")
 	}
-
 	if conf.NodeID == "" {
 		klog.Fatal("NodeID must be specified")
 	}
-
-	klog.Infof("Initializing CSI driver: %s version: %s nodeID: %s",
-		conf.DriverName, conf.Version, conf.NodeID)
-
+	klog.Infof("Initializing CSI driver: %s version: %s nodeID: %s", conf.DriverName, conf.Version, conf.NodeID)
 	return &driver{
 		name:         conf.DriverName,
 		version:      conf.Version,
@@ -92,19 +89,19 @@ func (d *driver) Run(conf *GlobalConfig) {
 		provider := strings.ToLower(os.Getenv("CSI_PROVIDER"))
 		if provider != "static" {
 			caps = append(caps,
+				csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 				csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 				csi.ControllerServiceCapability_RPC_MODIFY_VOLUME,
 				csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 				csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
+				csi.ControllerServiceCapability_RPC_GET_SNAPSHOT,
 			)
 		}
-
 		d.AddControllerServiceCapabilities(caps)
 	}
 
 	d.idServer = NewIdentityServer(d)
 	d.nodeServer = NewNodeServer(d)
-
 	if conf.IsControllerServer {
 		d.controllerServer = NewControllerServer(d)
 	}
