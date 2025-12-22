@@ -1,6 +1,6 @@
 module github.com/kubernetes-csi/csi-driver-nvmf
 
-go 1.25
+go 1.25.5
 
 require (
 	github.com/container-storage-interface/spec v1.12.0
