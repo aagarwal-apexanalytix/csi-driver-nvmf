@@ -25,10 +25,13 @@ RUN make
 # ----------------------------------------------------------------------------
 FROM debian:13
 
-# Install runtime dependencies
+# Install runtime dependencies for multiple filesystem types
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         e2fsprogs \
+        xfsprogs \
+        btrfs-progs \
+        util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
