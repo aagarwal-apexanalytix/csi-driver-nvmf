@@ -477,7 +477,12 @@ func (cs *ControllerServer) getSourceFstype(sourceVolID string, restURL string, 
 			if prefixIdx == -1 {
 				return "", fmt.Errorf("fstype not found in comment for source volume %s", sourceVolID)
 			}
-			fstype := strings.TrimSpace(commentStr[prefixIdx+len(fstypePrefix):])
+			fstypeStr := commentStr[prefixIdx+len(fstypePrefix):]
+			fstypeParts := strings.SplitN(fstypeStr, " ", 2)
+			if len(fstypeParts) == 0 {
+				return "", fmt.Errorf("no fstype value found in comment for source volume %s", sourceVolID)
+			}
+			fstype := strings.TrimSpace(fstypeParts[0])
 			return fstype, nil
 		}
 	}
