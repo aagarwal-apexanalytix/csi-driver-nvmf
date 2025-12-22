@@ -23,6 +23,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -463,16 +464,21 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 	}, nil
 }
 
-func (cs *ControllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
+func (cs *ControllerServer) ListVolumes(_ context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	cs.initConfig()
+
 	if cs.provider == ProviderStatic {
+		// Static mode: no managed volumes to list
 		return &csi.ListVolumesResponse{Entries: []*csi.ListVolumesResponse_Entry{}}, nil
 	}
+
 	disks, err := cs.restGet("/disk", cs.restURL, cs.username, cs.password)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "List disks failed: %v", err)
 	}
-	var entries []*csi.ListVolumesResponse_Entry
+
+	// Collect all exported volumes
+	var volumes []*csi.Volume
 	for _, d := range disks {
 		slot, _ := d["slot"].(string)
 		if slot == "" {
@@ -487,15 +493,53 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, _ *csi.ListVolumesReq
 			sizeStr, _ = d["size"].(string)
 		}
 		capBytes := parseSizeToBytes(sizeStr)
-		entries = append(entries, &csi.ListVolumesResponse_Entry{
-			Volume: &csi.Volume{
-				VolumeId:      slot,
-				CapacityBytes: capBytes,
-			},
+
+		volumes = append(volumes, &csi.Volume{
+			VolumeId:      slot,
+			CapacityBytes: capBytes,
 		})
 	}
-	klog.V(4).Infof("ListVolumes returning %d volumes", len(entries))
-	return &csi.ListVolumesResponse{Entries: entries}, nil
+
+	// Sort by VolumeId for deterministic, stable pagination
+	sort.Slice(volumes, func(i, j int) bool {
+		return volumes[i].VolumeId < volumes[j].VolumeId
+	})
+
+	// Pagination handling
+	startIdx := 0
+	if token := req.GetStartingToken(); token != "" {
+		if i, err := strconv.Atoi(token); err == nil && i >= 0 && i < len(volumes) {
+			startIdx = i
+		} else {
+			return nil, status.Errorf(codes.Aborted, "invalid starting token %q", token)
+		}
+	}
+
+	maxEntries := int(req.GetMaxEntries())
+	endIdx := len(volumes)
+	if maxEntries > 0 && startIdx+maxEntries < endIdx {
+		endIdx = startIdx + maxEntries
+	}
+
+	entries := make([]*csi.ListVolumesResponse_Entry, 0, endIdx-startIdx)
+	for i := startIdx; i < endIdx; i++ {
+		entries = append(entries, &csi.ListVolumesResponse_Entry{
+			Volume: volumes[i],
+		})
+	}
+
+	nextToken := ""
+	if endIdx < len(volumes) {
+		nextToken = strconv.Itoa(endIdx)
+	}
+
+	klog.V(4).Infof("ListVolumes returning %d entries (total exported volumes: %d, nextToken: %s)",
+		len(entries), len(volumes), nextToken)
+
+	return &csi.ListVolumesResponse{
+		Entries:   entries,
+		NextToken: nextToken,
+	}, nil
 }
 
 func (cs *ControllerServer) GetCapacity(_ context.Context, _ *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
