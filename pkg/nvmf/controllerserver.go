@@ -42,37 +42,6 @@ const (
 	minVolumeSize     = 1 * 1024 * 1024 // 1 MiB
 )
 
-var supportedCompression = map[string]string{
-	// Explicit disable / no compression
-	"no":       "",
-	"none":     "",
-	"off":      "",
-	"false":    "",
-	"disabled": "",
-
-	// Zstd - all officially supported levels by Btrfs (1 through 15)
-	"zstd":    "zstd", // same as zstd:3 - btrfs default
-	"zstd:1":  "zstd:1",
-	"zstd:2":  "zstd:2",
-	"zstd:3":  "zstd:3",
-	"zstd:4":  "zstd:4",
-	"zstd:5":  "zstd:5",
-	"zstd:6":  "zstd:6",
-	"zstd:7":  "zstd:7",
-	"zstd:8":  "zstd:8",
-	"zstd:9":  "zstd:9",
-	"zstd:10": "zstd:10",
-	"zstd:11": "zstd:11",
-	"zstd:12": "zstd:12",
-	"zstd:13": "zstd:13",
-	"zstd:14": "zstd:14",
-	"zstd:15": "zstd:15", // maximum compression ratio supported by btrfs
-
-	// Legacy / alternative algorithms
-	"lzo":  "lzo",
-	"zlib": "zlib",
-}
-
 type ControllerServer struct {
 	csi.UnimplementedControllerServer
 	Driver       *driver
@@ -111,23 +80,23 @@ func (cs *ControllerServer) initConfig() {
 	}
 }
 
-func getEffectiveCompression(params map[string]string, driverDefault string) string {
-	for _, source := range []string{"PVC", "StorageClass"} {
-		if val, ok := params["compression"]; ok {
-			val = strings.ToLower(strings.TrimSpace(val))
-			if mapped, supported := supportedCompression[val]; supported {
-				klog.V(4).Infof("Using %s compression setting: %s → %s", source, val, mapped)
-				return mapped
-			}
-			klog.Warningf("Invalid compression value from %s: %q → checking next priority", source, val)
+func getEffectiveCompress(params map[string]string) string {
+	if val, ok := params["compression"]; ok {
+		val = strings.ToLower(strings.TrimSpace(val))
+		switch val {
+		case "off", "none", "no", "false", "disabled":
+			return "no"
+		case "on", "yes", "true", "enabled", "zstd", "zstd:1", "zstd:2", "zstd:3", "zstd:4",
+			"zstd:5", "zstd:6", "zstd:7", "zstd:8", "zstd:9", "zstd:10", "zstd:11",
+			"zstd:12", "zstd:13", "zstd:14", "zstd:15", "lzo", "zlib":
+			return "yes"
+		default:
+			klog.Warningf("Invalid compression value %q → defaulting to compress=no", val)
 		}
 	}
-	if driverDefault != "" {
-		klog.V(4).Infof("Using driver default compression: %s", driverDefault)
-	} else {
-		klog.V(4).Infof("No compression configured (driver default)")
-	}
-	return driverDefault
+
+	klog.V(4).Infof("No compression parameter specified → defaulting to compress=no")
+	return "no"
 }
 
 // Generic REST helper (takes credentials per call for per-SC support)
@@ -248,13 +217,18 @@ func (cs *ControllerServer) volumeExists(volumeID, restURL, username, password s
 
 func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	cs.initConfig()
-	klog.V(4).Infof("CreateVolume requested: name=%s, capacityRange=%v, parameters=%v, contentSource=%v", req.GetName(), req.CapacityRange, req.Parameters, req.VolumeContentSource)
+	klog.V(4).Infof("CreateVolume requested: name=%s, capacityRange=%v, parameters=%v, contentSource=%v",
+		req.GetName(), req.CapacityRange, req.Parameters, req.VolumeContentSource)
+
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume name required")
 	}
+
 	contentSource := req.GetVolumeContentSource()
+
 	// Extract parameters early
 	params := req.Parameters
+
 	fstype := params["csi.storage.k8s.io/fstype"]
 	if fstype == "" {
 		fstype = params["fstype"]
@@ -265,22 +239,27 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if fstype != "ext4" && fstype != "xfs" {
 		klog.Warningf("Requested fstype %q is not explicitly supported by online resize logic (supported: ext4, xfs)", fstype)
 	}
+
 	targetAddr, ok := params["targetAddr"]
 	if !ok || targetAddr == "" {
 		return nil, status.Error(codes.InvalidArgument, "targetAddr is required in StorageClass parameters")
 	}
+
 	targetPort := params["targetPort"]
 	if targetPort == "" {
 		targetPort = defaultTargetPort
 	}
+
 	backendDisk := params["backendDisk"]
 	if backendDisk == "" {
 		backendDisk = cs.backendDisk
 	}
+
 	backendMount := params["backendMount"]
 	if backendMount == "" {
 		backendMount = cs.backendMount
 	}
+
 	// CSI metadata
 	pvcNamespace := params["csi.storage.k8s.io/pvc/namespace"]
 	pvcHumanName := params["csi.storage.k8s.io/pvc/name"]
@@ -297,10 +276,12 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		klog.Warningf("PV name param missing - falling back to req.Name")
 		pvName = req.Name
 	}
+
 	clusterName := params["clusterName"]
 	if clusterName == "" {
 		clusterName = "unknown"
 	}
+
 	// Resolve per-SC credentials
 	localRestURL := params["restURL"]
 	if localRestURL == "" {
@@ -309,6 +290,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if localRestURL == "" {
 		return nil, status.Error(codes.InvalidArgument, "restURL required (no global configured)")
 	}
+
 	localUsername := params["username"]
 	if localUsername == "" {
 		localUsername = cs.username
@@ -316,6 +298,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if localUsername == "" {
 		return nil, status.Error(codes.InvalidArgument, "username required (no global configured)")
 	}
+
 	localPassword := params["password"]
 	if localPassword == "" {
 		localPassword = cs.password
@@ -323,6 +306,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if localPassword == "" {
 		return nil, status.Error(codes.InvalidArgument, "password required (no global configured)")
 	}
+
 	// Handle content source (clone or restore from snapshot)
 	var parentSubvol string
 	var sourceCapacity int64
@@ -337,18 +321,22 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			return nil, err
 		}
 	}
+
 	// Base comment (using effective fstype)
 	comment := fmt.Sprintf("k8s-pvc:%s:%s/%s (pv:%s) fstype:%s%s", clusterName, pvcNamespace, pvcHumanName, pvName, fstype, cloneInfo)
+
 	// Volume ID / slot
 	volumeID := strings.ReplaceAll(strings.ToLower(pvName), "-", "")
 	slot := volumeID
 	subVolName := "vol-" + volumeID
 	imgPath := backendMount + "/" + subVolName + "/volume.img"
+
 	// Determine effective capacity
 	requiredBytes := int64(0)
 	if req.CapacityRange != nil {
 		requiredBytes = req.CapacityRange.GetRequiredBytes()
 	}
+
 	var effectiveBytes int64
 	if contentSource != nil {
 		if requiredBytes > 0 && requiredBytes < sourceCapacity {
@@ -364,10 +352,12 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			effectiveBytes = minVolumeSize
 		}
 	}
+
 	// Round up to full GiB
 	giBFloat := math.Ceil(float64(effectiveBytes) / (1024.0 * 1024.0 * 1024.0))
 	sizeGiB := fmt.Sprintf("%dG", int64(giBFloat))
 	actualBytes := int64(giBFloat) * 1024 * 1024 * 1024
+
 	// Static provider handling
 	if cs.provider == ProviderStatic {
 		exists, currentSize, _ := cs.volumeExists(volumeID, cs.restURL, cs.username, cs.password)
@@ -392,6 +382,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			},
 		}, nil
 	}
+
 	// Idempotency check
 	exists, currentSize, err := cs.volumeExists(volumeID, localRestURL, localUsername, localPassword)
 	if err != nil {
@@ -427,36 +418,20 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		}
 		return nil, status.Error(codes.AlreadyExists, "Volume exists with smaller size than requested")
 	}
+
 	// Provision new volume
 	klog.V(4).Infof("Provisioning new volume %s (slot=%s, size=%s)%s", req.Name, slot, sizeGiB, cloneInfo)
+
 	// Create BTRFS subvolume (empty or snapshot)
 	subvolData := map[string]string{
 		"fs":   backendDisk,
 		"name": subVolName,
 	}
-
-	const driverDefaultCompression = ""
-
-	compression := getEffectiveCompression(params, driverDefaultCompression)
-
-	var compressInfo string
-	if compression == "" {
-		compressInfo = "no compression"
-	} else if compression == "zstd" {
-		compressInfo = "zstd (level 3 - btrfs default)"
-	} else {
-		compressInfo = compression
-	}
-	klog.Infof("Subvolume compression setting: %s", compressInfo)
-
-	if compression != "" {
-		subvolData["compression"] = compression
-	}
-
 	if parentSubvol != "" {
 		subvolData["parent"] = parentSubvol
 		subvolData["read-only"] = "no" // Ensure RW for clone
 	}
+
 	err = cs.restPost("/disk/btrfs/subvolume/add", subvolData, localRestURL, localUsername, localPassword)
 	if err != nil {
 		if strings.Contains(err.Error(), "exists") || strings.Contains(err.Error(), "File exists") {
@@ -465,6 +440,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			return nil, status.Errorf(codes.Internal, "Subvolume create failed: %v", err)
 		}
 	}
+
 	// Create file-backed disk
 	diskData := map[string]string{
 		"type":      "file",
@@ -472,10 +448,12 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		"file-size": sizeGiB,
 		"slot":      slot,
 	}
+
 	if err := cs.restPost("/disk/add", diskData, localRestURL, localUsername, localPassword); err != nil {
 		_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
 		return nil, status.Errorf(codes.Internal, "Disk create failed: %v", err)
 	}
+
 	// Enable export
 	diskID, err := cs.getDiskID(slot, localRestURL, localUsername, localPassword)
 	if err != nil {
@@ -483,6 +461,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, localRestURL, localUsername, localPassword)
 		return nil, status.Errorf(codes.Internal, "Failed to retrieve disk .id for export: %v", err)
 	}
+
 	exportData := map[string]string{
 		"nvme-tcp-export": "yes",
 		"nvme-tcp-port":   targetPort,
@@ -501,6 +480,26 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			return nil, status.Errorf(codes.Internal, "Export enable failed: %v / %v", err, err2)
 		}
 	}
+
+	compressValue := getEffectiveCompress(params)
+	if compressValue != "" {
+		setData := map[string]string{
+			"numbers":  diskID,
+			"compress": compressValue,
+		}
+		err = cs.restPost("/disk/set", setData, localRestURL, localUsername, localPassword)
+		if err != nil {
+			klog.Warningf("Failed to set compress=%s on disk %s (requested: %s): %v (continuing anyway)",
+				compressValue, diskID, params["compression"], err)
+		} else {
+			klog.Infof("Successfully set compress=%s on disk %s for volume %s (requested: %s)",
+				compressValue, diskID, volumeID, params["compression"])
+		}
+
+		// Record in comment for visibility in /disk print
+		comment += fmt.Sprintf(" compress:%s", compressValue)
+	}
+
 	// Set comment
 	commentData := map[string]string{
 		"numbers": diskID,
@@ -511,7 +510,9 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	} else {
 		klog.V(4).Infof("Added comment: %s", comment)
 	}
+
 	klog.V(4).Infof("Successfully created volume %s (actual size %d bytes)%s", volumeID, actualBytes, cloneInfo)
+
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:      volumeID,
@@ -523,6 +524,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 				"nqn":                       slot,
 				"deviceID":                  slot,
 				"csi.storage.k8s.io/fstype": fstype,
+				"compression":               compressValue,
 			},
 			ContentSource: contentSource,
 		},
