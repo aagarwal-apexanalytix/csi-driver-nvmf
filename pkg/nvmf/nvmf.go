@@ -77,6 +77,7 @@ func getNVMfDiskInfo(req *csi.NodePublishVolumeRequest) (*nvmfDiskInfo, error) {
 }
 
 // AttachDisk handles publishing the NVMe device (raw block or formatted filesystem).
+// AttachDisk handles publishing the NVMe device (raw block or formatted filesystem).
 func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 	targetPath := req.GetTargetPath()
 	mounter := mount.New("")
@@ -86,38 +87,43 @@ func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 		return fmt.Errorf("volume capability missing in request")
 	}
 
+	// ===== RAW BLOCK VOLUME =====
 	if block := req.GetVolumeCapability().GetBlock(); block != nil {
-		// ==== Raw block volume ==== (unchanged)
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-			return fmt.Errorf("failed to create parent dir for target %s: %w", targetPath, err)
-		}
+		klog.V(4).Infof("AttachDisk: handling raw block volume at target %s (device %s)", targetPath, devicePath)
+
+		// Idempotency check: already published?
 		if fi, err := os.Lstat(targetPath); err == nil {
-			if (fi.Mode() & os.ModeDevice) != 0 {
-				klog.V(4).Infof("AttachDisk: raw block already published at %s", targetPath)
+			// Exists as symlink, device, or something usable → assume good
+			if (fi.Mode()&os.ModeSymlink) != 0 || (fi.Mode()&os.ModeDevice) != 0 {
+				klog.V(4).Infof("Raw block already published at %s (symlink/device exists) - skipping", targetPath)
 				return nil
 			}
+			// If it's a regular file or directory (stale?), we'll clean it up below
 		}
-		if _, err := os.Stat(targetPath); os.IsNotExist(err) {
-			f, createErr := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY, 0660)
-			if createErr != nil {
-				return fmt.Errorf("failed to create block placeholder file %s: %w", targetPath, createErr)
-			}
-			_ = f.Close()
+
+		// Clean up any stale target (best-effort)
+		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+			klog.Warningf("Failed to remove stale target %s: %v", targetPath, err)
 		}
-		mountOptions := []string{"bind"}
-		if req.GetReadonly() {
-			mountOptions = append(mountOptions, "ro")
+
+		// Create parent directory if needed
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return fmt.Errorf("failed to create parent dir for %s: %w", targetPath, err)
 		}
-		if err := mounter.Mount(devicePath, targetPath, "", mountOptions); err != nil {
-			_ = os.Remove(targetPath)
-			return fmt.Errorf("failed to bind-mount device %s to %s: %w", devicePath, targetPath, err)
+
+		// Create symlink to the real NVMe device
+		if err := os.Symlink(devicePath, targetPath); err != nil {
+			return fmt.Errorf("failed to create symlink %s -> %s: %w", targetPath, devicePath, err)
 		}
-		klog.Infof("AttachDisk: Successfully published raw block device %s to %s", devicePath, targetPath)
+
+		klog.Infof("AttachDisk: Successfully published raw block via symlink %s -> %s", targetPath, devicePath)
 		return nil
 	}
 
+	// ===== FILESYSTEM VOLUME =====
 	if mountCap := req.GetVolumeCapability().GetMount(); mountCap != nil {
-		// ==== Filesystem volume ====
+		klog.V(4).Infof("AttachDisk: handling filesystem volume at target %s (device %s)", targetPath, devicePath)
+
 		notMounted, err := safeMounter.IsLikelyNotMountPoint(targetPath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -129,14 +135,15 @@ func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 				return fmt.Errorf("cannot check if %s is mount point: %w", targetPath, err)
 			}
 		}
+
 		if !notMounted {
-			klog.Infof("AttachDisk: %s is already mounted", targetPath)
+			klog.Infof("AttachDisk: %s is already mounted - skipping", targetPath)
 			return nil
 		}
 
-		fsType := req.VolumeContext["csi.storage.k8s.io/fstype"] // StorageClass (provision-time)
+		fsType := req.VolumeContext["csi.storage.k8s.io/fstype"]
 		if fsType == "" {
-			fsType = mountCap.GetFsType() // Pod volume spec (runtime override)
+			fsType = mountCap.GetFsType()
 		}
 		if fsType == "" {
 			fsType = "ext4"
@@ -155,14 +162,14 @@ func AttachDisk(req *csi.NodePublishVolumeRequest, devicePath string) error {
 		}
 
 		if err = safeMounter.FormatAndMount(devicePath, targetPath, fsType, options); err != nil {
-			return fmt.Errorf("failed to format and mount device %s to %s: %w", devicePath, targetPath, err)
+			return fmt.Errorf("failed to format and mount %s to %s (%s): %w", devicePath, targetPath, fsType, err)
 		}
 
-		klog.Infof("AttachDisk: Successfully mounted filesystem device %s to %s", devicePath, targetPath)
+		klog.Infof("AttachDisk: Successfully mounted filesystem %s to %s (%s)", devicePath, targetPath, fsType)
 		return nil
 	}
 
-	return fmt.Errorf("unsupported volume capability")
+	return fmt.Errorf("unsupported volume capability type")
 }
 
 // DetachDisk performs unmount and cleanup of the target path (handles both block and filesystem cases).
@@ -173,33 +180,47 @@ func DetachDisk(targetPath string) error {
 		Exec:      exec.New(),
 	}
 
-	// Handle raw block case (target_path is the bind-mounted file)
-	if _, err := os.Lstat(targetPath); err == nil {
-		isNotMountPoint, checkErr := mounter.IsLikelyNotMountPoint(targetPath)
-		if checkErr == nil && !isNotMountPoint {
-			if umErr := mounter.Unmount(targetPath); umErr != nil {
-				klog.Errorf("failed to unmount block file %s: %v", targetPath, umErr)
+	// Stat the target path
+	fi, err := os.Lstat(targetPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			klog.Warningf("DetachDisk: failed to stat %s: %v", targetPath, err)
+		}
+		// If not exist → just try to clean parent dir
+	} else {
+		// --- Symlink case (raw block) ---
+		if (fi.Mode() & os.ModeSymlink) != 0 {
+			klog.V(4).Infof("DetachDisk: removing symlink %s", targetPath)
+			if rmErr := os.Remove(targetPath); rmErr != nil {
+				klog.Warningf("DetachDisk: failed to remove symlink %s: %v", targetPath, rmErr)
+			}
+			// Symlink handled → proceed directly to parent cleanup
+		} else {
+			// --- Filesystem mount case ---
+			isNotMountPoint, checkErr := safeMounter.IsLikelyNotMountPoint(targetPath)
+			if checkErr != nil {
+				if !os.IsNotExist(checkErr) {
+					klog.Warningf("DetachDisk: failed to check mount point %s: %v", targetPath, checkErr)
+				}
+			} else if !isNotMountPoint {
+				if umErr := safeMounter.Unmount(targetPath); umErr != nil {
+					klog.Errorf("DetachDisk: failed to unmount %s: %v", targetPath, umErr)
+					// Continue even on failure (best-effort)
+				} else {
+					klog.V(4).Infof("DetachDisk: successfully unmounted filesystem %s", targetPath)
+				}
+			} else {
+				klog.V(4).Infof("DetachDisk: %s is not a mount point - no unmount needed", targetPath)
 			}
 		}
-
-		if rmErr := os.Remove(targetPath); rmErr != nil {
-			klog.Errorf("failed to remove block file %s: %v", targetPath, rmErr)
-		}
 	}
 
-	// Handle filesystem case
-	if isNotMountPoint, err := safeMounter.IsLikelyNotMountPoint(targetPath); err == nil && !isNotMountPoint {
-		if umErr := safeMounter.Unmount(targetPath); umErr != nil {
-			klog.Errorf("failed to unmount filesystem target %s: %v", targetPath, umErr)
-		}
-	}
-
-	// Remove parent publish directory if empty (best-effort)
+	// Common cleanup: remove parent directory if empty
 	parentDir := filepath.Dir(targetPath)
 	if err := os.Remove(parentDir); err != nil && !os.IsNotExist(err) {
-		klog.V(5).Infof("publish directory %s not removed (may not be empty): %v", parentDir, err)
+		klog.V(5).Infof("DetachDisk: publish directory %s not removed (may not be empty): %v", parentDir, err)
 	}
 
-	klog.V(4).Infof("DetachDisk: successfully cleaned up %s", targetPath)
+	klog.V(4).Infof("DetachDisk: cleanup completed for %s", targetPath)
 	return nil
 }
