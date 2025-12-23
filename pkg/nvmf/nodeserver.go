@@ -46,6 +46,17 @@ func NewNodeServer(d *driver) *NodeServer {
 	}
 }
 
+func isEphemeral(volumeContext map[string]string) bool {
+	return volumeContext["csi.storage.k8s.io/ephemeral"] == "true"
+}
+
+func getPodName(volumeContext map[string]string) string {
+	if name, ok := volumeContext["csi.storage.k8s.io/pod/name"]; ok {
+		return name
+	}
+	return "unknown-pod"
+}
+
 func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	klog.V(4).Infof("NodeGetCapabilities called")
 
@@ -72,6 +83,13 @@ func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabi
 					},
 				},
 			},
+			{
+				Type: &csi.NodeServiceCapability_Rpc{
+					Rpc: &csi.NodeServiceCapability_RPC{
+						Type: csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP,
+					},
+				},
+			},
 		},
 	}, nil
 }
@@ -85,6 +103,13 @@ func (n *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolume
 		return nil, status.Error(codes.InvalidArgument, "Volume Capability missing in request")
 	}
 
+	isEph := isEphemeral(req.GetVolumeContext())
+	podName := getPodName(req.GetVolumeContext())
+
+	if isEph {
+		klog.Infof("NodeStageVolume: Ephemeral volume %s for pod %s", volumeID, podName)
+	}
+
 	diskInfo, err := getNVMfDiskInfo(&csi.NodePublishVolumeRequest{
 		VolumeId:         volumeID,
 		VolumeContext:    req.GetVolumeContext(),
@@ -94,7 +119,9 @@ func (n *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolume
 		return nil, status.Errorf(codes.InvalidArgument, "Failed to extract NVMe info: %v", err)
 	}
 
-	klog.V(4).Infof("NodeStageVolume: connecting volume %s (addr=%s, port=%s, nqn=%s)", volumeID, diskInfo.Addr, diskInfo.Port, diskInfo.Nqn)
+	klog.V(4).Infof("NodeStageVolume: connecting volume %s (addr=%s, port=%s, nqn=%s)%s",
+		volumeID, diskInfo.Addr, diskInfo.Port, diskInfo.Nqn,
+		map[bool]string{true: " (ephemeral)", false: ""}[isEph])
 
 	connector := getNvmfConnector(diskInfo)
 	devicePath, err := connector.Connect()
@@ -107,7 +134,7 @@ func (n *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolume
 
 	klog.V(4).Infof("NodeStageVolume: volume %s connected at device %s", volumeID, devicePath)
 
-	// Persist connector info for recovery
+	// Persist connector info
 	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
 	if err := persistConnectorFile(connector, connectorFilePath); err != nil {
 		_ = connector.Disconnect()
@@ -124,7 +151,10 @@ func (n *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVo
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
 
-	klog.V(4).Infof("NodeUnstageVolume: disconnecting volume %s", volumeID)
+	isEph := strings.HasPrefix(volumeID, "ephemeral-")
+
+	klog.V(4).Infof("NodeUnstageVolume: disconnecting volume %s%s", volumeID,
+		map[bool]string{true: " (ephemeral)", false: ""}[isEph])
 
 	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
 	connector, err := GetConnectorFromFile(connectorFilePath)
@@ -153,7 +183,14 @@ func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVo
 	volumeID := req.GetVolumeId()
 	targetPath := req.GetTargetPath()
 
-	klog.V(4).Infof("NodePublishVolume: volume %s to target %s", volumeID, targetPath)
+	isEph := isEphemeral(req.GetVolumeContext())
+	podName := getPodName(req.GetVolumeContext())
+
+	if isEph {
+		klog.Infof("NodePublishVolume: Publishing ephemeral volume %s for pod %s to %s", volumeID, podName, targetPath)
+	} else {
+		klog.V(4).Infof("NodePublishVolume: publishing volume %s to %s", volumeID, targetPath)
+	}
 
 	// Get or recover connector
 	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
@@ -183,7 +220,7 @@ func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVo
 
 	klog.V(4).Infof("NodePublishVolume: volume %s connected at device %s", volumeID, devicePath)
 
-	// Persist if fallback (non-critical)
+	// Persist if fallback (non-critical for ephemeral too)
 	if err := persistConnectorFile(connector, connectorFilePath); err != nil {
 		klog.Warningf("Failed to persist connector for volume %s (non-critical): %v", volumeID, err)
 	}
@@ -211,13 +248,17 @@ func (n *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubli
 	targetPath := req.GetTargetPath()
 	volumeID := req.GetVolumeId()
 
-	klog.V(4).Infof("NodeUnpublishVolume: unpublishing volume %s at %s", volumeID, targetPath)
+	isEph := strings.HasPrefix(volumeID, "ephemeral-")
+
+	klog.V(4).Infof("NodeUnpublishVolume: unpublishing volume %s at %s%s", volumeID, targetPath,
+		map[bool]string{true: " (ephemeral)", false: ""}[isEph])
 
 	if err := DetachDisk(targetPath); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to detach volume %s: %v", volumeID, err)
 	}
 
 	klog.V(4).Infof("NodeUnpublishVolume: successfully unpublished volume %s", volumeID)
+
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
