@@ -997,6 +997,8 @@ func (cs *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.
 	add(csi.ControllerServiceCapability_RPC_LIST_VOLUMES)
 	add(csi.ControllerServiceCapability_RPC_GET_CAPACITY)
 	add(csi.ControllerServiceCapability_RPC_GET_VOLUME)
+	add(csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME)
+
 	if cs.provider != ProviderStatic {
 		add(csi.ControllerServiceCapability_RPC_CLONE_VOLUME)
 		add(csi.ControllerServiceCapability_RPC_MODIFY_VOLUME)
