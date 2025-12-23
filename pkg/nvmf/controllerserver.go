@@ -42,6 +42,37 @@ const (
 	minVolumeSize     = 1 * 1024 * 1024 // 1 MiB
 )
 
+var supportedCompression = map[string]string{
+	// Explicit disable / no compression
+	"no":       "",
+	"none":     "",
+	"off":      "",
+	"false":    "",
+	"disabled": "",
+
+	// Zstd - all officially supported levels by Btrfs (1 through 15)
+	"zstd":    "zstd", // same as zstd:3 - btrfs default
+	"zstd:1":  "zstd:1",
+	"zstd:2":  "zstd:2",
+	"zstd:3":  "zstd:3",
+	"zstd:4":  "zstd:4",
+	"zstd:5":  "zstd:5",
+	"zstd:6":  "zstd:6",
+	"zstd:7":  "zstd:7",
+	"zstd:8":  "zstd:8",
+	"zstd:9":  "zstd:9",
+	"zstd:10": "zstd:10",
+	"zstd:11": "zstd:11",
+	"zstd:12": "zstd:12",
+	"zstd:13": "zstd:13",
+	"zstd:14": "zstd:14",
+	"zstd:15": "zstd:15", // maximum compression ratio supported by btrfs
+
+	// Legacy / alternative algorithms
+	"lzo":  "lzo",
+	"zlib": "zlib",
+}
+
 type ControllerServer struct {
 	csi.UnimplementedControllerServer
 	Driver       *driver
@@ -78,6 +109,25 @@ func (cs *ControllerServer) initConfig() {
 	if cs.provider == "" {
 		cs.provider = ProviderStatic
 	}
+}
+
+func getEffectiveCompression(params map[string]string, driverDefault string) string {
+	for _, source := range []string{"PVC", "StorageClass"} {
+		if val, ok := params["compression"]; ok {
+			val = strings.ToLower(strings.TrimSpace(val))
+			if mapped, supported := supportedCompression[val]; supported {
+				klog.V(4).Infof("Using %s compression setting: %s → %s", source, val, mapped)
+				return mapped
+			}
+			klog.Warningf("Invalid compression value from %s: %q → checking next priority", source, val)
+		}
+	}
+	if driverDefault != "" {
+		klog.V(4).Infof("Using driver default compression: %s", driverDefault)
+	} else {
+		klog.V(4).Infof("No compression configured (driver default)")
+	}
+	return driverDefault
 }
 
 // Generic REST helper (takes credentials per call for per-SC support)
@@ -384,6 +434,25 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		"fs":   backendDisk,
 		"name": subVolName,
 	}
+
+	const driverDefaultCompression = ""
+
+	compression := getEffectiveCompression(params, driverDefaultCompression)
+
+	var compressInfo string
+	if compression == "" {
+		compressInfo = "no compression"
+	} else if compression == "zstd" {
+		compressInfo = "zstd (level 3 - btrfs default)"
+	} else {
+		compressInfo = compression
+	}
+	klog.Infof("Subvolume compression setting: %s", compressInfo)
+
+	if compression != "" {
+		subvolData["compression"] = compression
+	}
+
 	if parentSubvol != "" {
 		subvolData["parent"] = parentSubvol
 		subvolData["read-only"] = "no" // Ensure RW for clone
