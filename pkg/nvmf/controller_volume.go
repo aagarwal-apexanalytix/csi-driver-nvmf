@@ -1,9 +1,12 @@
 // Package nvmf - ControllerServer volume lifecycle (Create/Delete/List/Expand/GetCapacity/GetVolume)
 //
 // Updates for nvme-proxy disk model changes:
-//   - nvme-proxy CreateDiskRequest.NvmeTcpExport is now *bool (JSON boolean) and NvmeTcpPort is *int
-//   - nvme-proxy DiskResponse now returns nvmeTcpExport/nvmeTcpDesired as bool and nvmeTcpPort as int
-//   - DO NOT call BTRFS subvolume APIs for nvme-proxy (MikroTik only)
+// - nvme-proxy CreateDiskRequest.NvmeTcpExport is now *bool (JSON boolean) and NvmeTcpPort is *int
+// - nvme-proxy DiskResponse now returns nvmeTcpExport/nvmeTcpDesired as bool and nvmeTcpPort as int
+// - DO NOT call BTRFS subvolume APIs for nvme-proxy (MikroTik only)
+//
+// Additional update:
+// - For nvme-proxy provider, fetch NQN from nvme-proxy (GET /disk/:slot) instead of assuming nqn == volumeID.
 //
 // You still need to wire your rest helpers (restGet/restPost/restPatch/restDelete),
 // config/initConfig, and any snapshot/clone helpers you already have.
@@ -11,6 +14,7 @@ package nvmf
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -25,8 +29,11 @@ import (
 
 func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	cs.initConfig()
-	klog.V(4).Infof("CreateVolume requested: name=%s, capacityRange=%v, parameters=%v, contentSource=%v",
-		req.GetName(), req.CapacityRange, req.Parameters, req.VolumeContentSource)
+
+	klog.V(4).Infof(
+		"CreateVolume requested: name=%s, capacityRange=%v, parameters=%v, contentSource=%v",
+		req.GetName(), req.CapacityRange, req.Parameters, req.VolumeContentSource,
+	)
 
 	if req.GetName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume name required")
@@ -99,7 +106,6 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if localRestURL == "" {
 		return nil, status.Error(codes.InvalidArgument, "restURL required (no global configured)")
 	}
-
 	localUsername := strings.TrimSpace(params["username"])
 	if localUsername == "" {
 		localUsername = cs.username
@@ -120,8 +126,8 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	}
 
 	// cloning / restore
-	// NOTE: for nvme-proxy, do NOT use BTRFS subvol APIs. Content source support for nvme-proxy
-	// should be implemented using nvme-proxy snapshot/clone endpoints (if/when wired).
+	// NOTE: for nvme-proxy, do NOT use BTRFS subvol APIs.
+	// Content source support for nvme-proxy should be implemented using nvme-proxy snapshot/clone endpoints (if/when wired).
 	contentSource := req.GetVolumeContentSource()
 	var parentSubvol string
 	var sourceCapacity int64
@@ -133,7 +139,6 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		if cs.provider == ProviderNvmeProxy {
 			return nil, status.Error(codes.Unimplemented, "ContentSource (clone/restore) not implemented for nvme-proxy in this controller path")
 		}
-
 		var err error
 		parentSubvol, sourceCapacity, cloneInfo, err = cs.handleContentSource(contentSource, localRestURL, localUsername, localPassword, &fstype)
 		if err != nil {
@@ -141,7 +146,10 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		}
 	}
 
-	comment := fmt.Sprintf("k8s-pvc:%s:%s:%s/%s (pv:%s) fstype:%s%s", clusterName, backendMount, pvcNamespace, pvcHumanName, pvName, fstype, cloneInfo)
+	comment := fmt.Sprintf(
+		"k8s-pvc:%s:%s:%s/%s (pv:%s) fstype:%s%s",
+		clusterName, backendMount, pvcNamespace, pvcHumanName, pvName, fstype, cloneInfo,
+	)
 
 	// IDs
 	volumeID := strings.ReplaceAll(strings.ToLower(pvName), "-", "")
@@ -208,6 +216,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Failed to check existing volume: %v", err)
 	}
+
 	if exists {
 		if currentSize >= actualBytes {
 			// best-effort comment update
@@ -219,14 +228,21 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 				}
 			}
 
+			// IMPORTANT: fetch NQN from nvme-proxy if applicable
+			nqn := slot
+			if cs.provider == ProviderNvmeProxy {
+				nqn = cs.getNvmeProxyNqn(slot, localRestURL, localUsername, localPassword)
+			}
+
 			volCtx := map[string]string{
 				"targetTrAddr":              targetAddr,
 				"targetTrPort":              targetPortStr,
 				"targetTrType":              "tcp",
-				"nqn":                       slot,
+				"nqn":                       nqn,
 				"deviceID":                  slot,
 				"csi.storage.k8s.io/fstype": fstype,
 			}
+
 			if cs.provider == ProviderNvmeProxy {
 				if v := nvmeProxyCompressFromParams(params); v != "" {
 					volCtx["compression"] = v
@@ -260,13 +276,15 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		// nvmeTcpExport: *bool, nvmeTcpPort: *int
 		enable := true
 		port := targetPortInt
+
 		diskData := map[string]any{
 			"slot":          slot,
 			"fileSize":      sizeGiB,
 			"comment":       comment,
-			"nvmeTcpExport": &enable, // ✅ pointer-to-bool matches *bool request type
-			"nvmeTcpPort":   &port,   // ✅ pointer-to-int matches *int request type
+			"nvmeTcpExport": &enable, // pointer-to-bool matches *bool
+			"nvmeTcpPort":   &port,   // pointer-to-int matches *int
 		}
+
 		if c := nvmeProxyCompressFromParams(params); c != "" {
 			diskData["compress"] = c
 			compressForContext = c
@@ -349,10 +367,13 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		}
 
 		// Comment
-		_ = cs.restPost("/disk/set", map[string]any{
-			"numbers": diskID,
-			"comment": comment,
-		}, localRestURL, localUsername, localPassword)
+		_ = cs.restPost("/disk/set", map[string]any{"numbers": diskID, "comment": comment}, localRestURL, localUsername, localPassword)
+	}
+
+	// IMPORTANT: fetch NQN from nvme-proxy if applicable
+	nqn := slot
+	if cs.provider == ProviderNvmeProxy {
+		nqn = cs.getNvmeProxyNqn(slot, localRestURL, localUsername, localPassword)
 	}
 
 	klog.V(4).Infof("Successfully created volume %s (actual size %d bytes)%s", volumeID, actualBytes, cloneInfo)
@@ -361,7 +382,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		"targetTrAddr":              targetAddr,
 		"targetTrPort":              targetPortStr,
 		"targetTrType":              "tcp",
-		"nqn":                       slot,
+		"nqn":                       nqn,
 		"deviceID":                  slot,
 		"csi.storage.k8s.io/fstype": fstype,
 	}
@@ -381,10 +402,12 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 
 func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	cs.initConfig()
+
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "VolumeId required")
 	}
+
 	klog.V(4).Infof("DeleteVolume requested for volume %s", volumeID)
 
 	if cs.provider == ProviderStatic {
@@ -426,6 +449,7 @@ func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
 
 func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
 	cs.initConfig()
+
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "VolumeId required")
@@ -466,16 +490,14 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 		}
 		if err := cs.restPatch("/disk/"+diskID, map[string]any{"file-size": newGiB}, restURL, username, password); err != nil {
 			// fallback to SET
-			if err2 := cs.restPost("/disk/set", map[string]any{
-				"numbers":   diskID,
-				"file-size": newGiB,
-			}, restURL, username, password); err2 != nil {
+			if err2 := cs.restPost("/disk/set", map[string]any{"numbers": diskID, "file-size": newGiB}, restURL, username, password); err2 != nil {
 				return nil, status.Errorf(codes.Internal, "Expand failed (PATCH .id: %v, SET .id: %v)", err, err2)
 			}
 		}
 	}
 
 	klog.V(4).Infof("Successfully expanded volume %s to %d bytes", volumeID, actualBytes)
+
 	return &csi.ControllerExpandVolumeResponse{
 		CapacityBytes:         actualBytes,
 		NodeExpansionRequired: true,
@@ -517,6 +539,7 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, req *csi.ListVolumesR
 				exported = (strings.ToLower(strings.TrimSpace(v)) == "yes")
 			}
 		}
+
 		if !exported {
 			continue
 		}
@@ -556,6 +579,7 @@ func (cs *ControllerServer) ListVolumes(_ context.Context, req *csi.ListVolumesR
 	}
 
 	klog.V(4).Infof("ListVolumes returning %d entries (total exported volumes: %d, nextToken: %s)", len(entries), len(volumes), nextToken)
+
 	return &csi.ListVolumesResponse{Entries: entries, NextToken: nextToken}, nil
 }
 
@@ -587,6 +611,7 @@ func (cs *ControllerServer) GetCapacity(_ context.Context, _ *csi.GetCapacityReq
 
 func (cs *ControllerServer) ControllerGetVolume(_ context.Context, req *csi.ControllerGetVolumeRequest) (*csi.ControllerGetVolumeResponse, error) {
 	cs.initConfig()
+
 	slot := req.GetVolumeId()
 	if slot == "" {
 		return nil, status.Error(codes.InvalidArgument, "VolumeId required")
@@ -603,15 +628,53 @@ func (cs *ControllerServer) ControllerGetVolume(_ context.Context, req *csi.Cont
 	}
 
 	return &csi.ControllerGetVolumeResponse{
-		Volume: &csi.Volume{
-			VolumeId:      slot,
-			CapacityBytes: capBytes,
-		},
+		Volume: &csi.Volume{VolumeId: slot, CapacityBytes: capBytes},
 		Status: &csi.ControllerGetVolumeResponse_VolumeStatus{
-			VolumeCondition: &csi.VolumeCondition{
-				Abnormal: false,
-				Message:  "Healthy",
-			},
+			VolumeCondition: &csi.VolumeCondition{Abnormal: false, Message: "Healthy"},
 		},
 	}, nil
+}
+
+// getNvmeProxyNqn fetches the NQN from nvme-proxy instead of assuming nqn == slot.
+// nvme-proxy route: GET /disk/:slot
+// Expected JSON includes: { ..., "slot":"...", "nqn":"...", ... }
+func (cs *ControllerServer) getNvmeProxyNqn(slot, restURL, username, password string) string {
+	d, err := cs.restGetOne("/disk/"+slot, restURL, username, password)
+	if err != nil {
+		klog.Warningf("nvme-proxy GET /disk/%s failed (fallback nqn=slot): %v", slot, err)
+		return slot
+	}
+
+	if v, ok := d["nqn"]; ok {
+		if s, ok2 := v.(string); ok2 && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+
+	// fallback
+	return slot
+}
+
+// restGetOne should perform a GET that returns a single JSON object (map).
+// If your existing restGet is list-oriented (returns []map), implement a separate method
+// that decodes to map[string]any for single-object endpoints.
+func (cs *ControllerServer) restGetOne(path, restURL, username, password string) (map[string]any, error) {
+	body, err := cs.restDo("GET", strings.TrimRight(restURL, "/")+path, nil, username, password)
+	if err != nil {
+		return nil, err
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err == nil && len(obj) > 0 {
+		return obj, nil
+	}
+
+	// If endpoint accidentally returns list, tolerate by picking first element.
+	var list []map[string]any
+	if err := json.Unmarshal(body, &list); err == nil && len(list) > 0 {
+		return list[0], nil
+	}
+
+	klog.Errorf("Failed to decode REST GET(one) %s response: %s", path, string(body))
+	return nil, fmt.Errorf("failed to decode REST GET(one) %s", path)
 }
