@@ -635,9 +635,6 @@ func (cs *ControllerServer) ControllerGetVolume(_ context.Context, req *csi.Cont
 	}, nil
 }
 
-// getNvmeProxyNqn fetches the NQN from nvme-proxy instead of assuming nqn == slot.
-// nvme-proxy route: GET /disk/:slot
-// Expected JSON includes: { ..., "slot":"...", "nqn":"...", ... }
 func (cs *ControllerServer) getNvmeProxyNqn(slot, restURL, username, password string) string {
 	d, err := cs.restGetOne("/disk/"+slot, restURL, username, password)
 	if err != nil {
@@ -645,13 +642,106 @@ func (cs *ControllerServer) getNvmeProxyNqn(slot, restURL, username, password st
 		return slot
 	}
 
-	if v, ok := d["nqn"]; ok {
-		if s, ok2 := v.(string); ok2 && strings.TrimSpace(s) != "" {
-			return strings.TrimSpace(s)
+	coerceString := func(v any) string {
+		switch t := v.(type) {
+		case string:
+			return strings.TrimSpace(t)
+		case fmt.Stringer:
+			return strings.TrimSpace(t.String())
+		default:
+			return ""
 		}
 	}
 
-	// fallback
+	// Declare first so it can call itself.
+	var tryKey func(obj map[string]any, key string) string
+
+	tryKey = func(obj map[string]any, key string) string {
+		v, ok := obj[key]
+		if !ok || v == nil {
+			return ""
+		}
+
+		// direct string
+		if s := coerceString(v); s != "" {
+			return s
+		}
+
+		// array like ["nqn...."] or [{...}]
+		if arr, ok := v.([]any); ok && len(arr) > 0 {
+			// first element string
+			if s := coerceString(arr[0]); s != "" {
+				return s
+			}
+			// first element map, look for nqn-ish fields inside
+			if m, ok := arr[0].(map[string]any); ok {
+				for _, kk := range []string{"nqn", "subnqn", "subsystemNqn"} {
+					if s := tryKey(m, kk); s != "" {
+						return s
+					}
+				}
+			}
+		}
+
+		// nested map like {"nqn": "..."} or {"subsystem":{"nqn":"..."}}
+		if m, ok := v.(map[string]any); ok {
+			for _, kk := range []string{"nqn", "subnqn", "subsystemNqn"} {
+				if s := tryKey(m, kk); s != "" {
+					return s
+				}
+			}
+		}
+
+		return ""
+	}
+
+	candidates := []string{
+		"nqn",
+		"subnqn",
+		"subNqn",
+		"subsystemNqn",
+		"subsystem_nqn",
+		"nvmeTcpNqn",
+		"nvme_tcp_nqn",
+		"exportNqn",
+		"export_nqn",
+		"targetNqn",
+		"target_nqn",
+	}
+
+	// 1) direct candidate lookup
+	for _, k := range candidates {
+		if s := tryKey(d, k); s != "" && s != slot {
+			return s
+		}
+	}
+
+	// 2) scan whole object for any "nqn"-ish key
+	for k, v := range d {
+		kl := strings.ToLower(strings.TrimSpace(k))
+		if strings.Contains(kl, "nqn") {
+			if s := coerceString(v); s != "" && s != slot {
+				return s
+			}
+			if m, ok := v.(map[string]any); ok {
+				for nk, nv := range m {
+					nkl := strings.ToLower(strings.TrimSpace(nk))
+					if strings.Contains(nkl, "nqn") {
+						if s := coerceString(nv); s != "" && s != slot {
+							return s
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 3) last resort: if it looks like an actual NQN, accept it even if equals slot
+	if s := tryKey(d, "nqn"); s != "" && strings.HasPrefix(strings.ToLower(s), "nqn.") {
+		return s
+	}
+
+	klog.Warningf("nvme-proxy GET /disk/%s returned no usable NQN; falling back to slot", slot)
 	return slot
 }
 
