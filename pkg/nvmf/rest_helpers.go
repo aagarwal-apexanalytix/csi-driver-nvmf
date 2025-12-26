@@ -26,6 +26,7 @@ func (cs *ControllerServer) restDo(method, url string, body []byte, username, pa
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+
 	resp, err := cs.client.Do(req)
 	if err != nil {
 		klog.Errorf("REST %s %s failed: %v", method, url, err)
@@ -42,7 +43,7 @@ func (cs *ControllerServer) restDo(method, url string, body []byte, username, pa
 }
 
 func (cs *ControllerServer) restGet(path, restURL, username, password string) ([]map[string]interface{}, error) {
-	body, err := cs.restDo("GET", restURL+path, nil, username, password)
+	body, err := cs.restDo("GET", strings.TrimRight(restURL, "/")+path, nil, username, password)
 	if err != nil {
 		return nil, err
 	}
@@ -63,19 +64,25 @@ func (cs *ControllerServer) restGet(path, restURL, username, password string) ([
 	return nil, fmt.Errorf("failed to decode REST GET %s", path)
 }
 
-func (cs *ControllerServer) restPost(path string, data map[string]string, restURL, username, password string) error {
-	jsonBody, _ := json.Marshal(data)
-	_, err := cs.restDo("POST", restURL+path, jsonBody, username, password)
+func (cs *ControllerServer) restPost(path string, data any, restURL, username, password string) error {
+	jsonBody, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal REST POST body for %s: %w", path, err)
+	}
+	_, err = cs.restDo("POST", strings.TrimRight(restURL, "/")+path, jsonBody, username, password)
 	return err
 }
 
-func (cs *ControllerServer) restPatch(path string, data map[string]string, restURL, username, password string) error {
-	jsonBody, _ := json.Marshal(data)
-	_, err := cs.restDo("PATCH", restURL+path, jsonBody, username, password)
+func (cs *ControllerServer) restPatch(path string, data any, restURL, username, password string) error {
+	jsonBody, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal REST PATCH body for %s: %w", path, err)
+	}
+	_, err = cs.restDo("PATCH", strings.TrimRight(restURL, "/")+path, jsonBody, username, password)
 	return err
 }
 
 func (cs *ControllerServer) restDelete(path, restURL, username, password string) error {
-	_, err := cs.restDo("DELETE", restURL+path, nil, username, password)
+	_, err := cs.restDo("DELETE", strings.TrimRight(restURL, "/")+path, nil, username, password)
 	return err
 }

@@ -44,9 +44,14 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if targetAddr == "" {
 		return nil, status.Error(codes.InvalidArgument, "targetAddr is required in StorageClass parameters")
 	}
-	targetPort := strings.TrimSpace(params["targetPort"])
-	if targetPort == "" {
-		targetPort = defaultTargetPort
+
+	targetPortStr := strings.TrimSpace(params["targetPort"])
+	if targetPortStr == "" {
+		targetPortStr = defaultTargetPort
+	}
+	targetPortInt, err := strconv.Atoi(targetPortStr)
+	if err != nil || targetPortInt <= 0 || targetPortInt > 65535 {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid targetPort %q (must be 1-65535)", targetPortStr)
 	}
 
 	// backend config
@@ -175,7 +180,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 				CapacityBytes: currentSize,
 				VolumeContext: map[string]string{
 					"targetTrAddr":              targetAddr,
-					"targetTrPort":              targetPort,
+					"targetTrPort":              targetPortStr,
 					"targetTrType":              "tcp",
 					"nqn":                       slot,
 					"deviceID":                  slot,
@@ -194,16 +199,16 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		if currentSize >= actualBytes {
 			// best-effort comment update
 			if cs.provider == ProviderNvmeProxy {
-				_ = cs.restPatch("/disk/"+slot, map[string]string{"comment": comment}, localRestURL, localUsername, localPassword)
+				_ = cs.restPatch("/disk/"+slot, map[string]any{"comment": comment}, localRestURL, localUsername, localPassword)
 			} else {
 				if diskID, getErr := cs.getDiskID(slot, localRestURL, localUsername, localPassword); getErr == nil {
-					_ = cs.restPost("/disk/set", map[string]string{"numbers": diskID, "comment": comment}, localRestURL, localUsername, localPassword)
+					_ = cs.restPost("/disk/set", map[string]any{"numbers": diskID, "comment": comment}, localRestURL, localUsername, localPassword)
 				}
 			}
 
 			volCtx := map[string]string{
 				"targetTrAddr":              targetAddr,
-				"targetTrPort":              targetPort,
+				"targetTrPort":              targetPortStr,
 				"targetTrType":              "tcp",
 				"nqn":                       slot,
 				"deviceID":                  slot,
@@ -232,12 +237,11 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	klog.V(4).Infof("Provisioning new volume %s (slot=%s, size=%s)%s", req.Name, slot, sizeGiB, cloneInfo)
 
 	// nvme-proxy can be BTRFS OR ZFS; if backendMount == "zfs" skip BTRFS subvol calls entirely
-	skipSubvol := cs.provider == ProviderNvmeProxy && strings.EqualFold(backendMount, "zfs")
+	skipSubvol := (cs.provider == ProviderNvmeProxy && strings.EqualFold(backendMount, "zfs"))
 
-	// Only MikroTik provider manages BTRFS subvolumes via RouterOS endpoints.
-	// For nvme-proxy, the server manages its backend (BTRFS or ZFS) internally.
-	if cs.provider != ProviderNvmeProxy {
-		subvolData := map[string]string{"fs": backendDisk, "name": subVolName}
+	// Create BTRFS subvolume (empty or snapshot) if applicable
+	if !skipSubvol {
+		subvolData := map[string]any{"fs": backendDisk, "name": subVolName}
 		if parentSubvol != "" {
 			subvolData["parent"] = parentSubvol
 			subvolData["read-only"] = "no"
@@ -256,12 +260,13 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	// Provider-specific disk create + export
 	if cs.provider == ProviderNvmeProxy {
 		// nvme-proxy: POST /disk/add
-		diskData := map[string]string{
+		// IMPORTANT: nvmeTcpPort must be int, nvmeTcpExport should be bool.
+		diskData := map[string]any{
 			"slot":          slot,
 			"fileSize":      sizeGiB,
 			"comment":       comment,
-			"nvmeTcpExport": "yes",
-			"nvmeTcpPort":   targetPort,
+			"nvmeTcpExport": true,
+			"nvmeTcpPort":   targetPortInt,
 		}
 		if c := nvmeProxyCompressFromParams(params); c != "" {
 			diskData["compress"] = c
@@ -276,15 +281,15 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 			return nil, status.Errorf(codes.Internal, "nvme-proxy disk create failed: %v", err)
 		}
 
-		// best-effort ensure export enabled
-		_ = cs.restPatch("/disk/"+slot, map[string]string{
-			"nvmeTcpExport": "true",
-			"nvmeTcpPort":   targetPort,
+		// best-effort ensure export enabled (types matter)
+		_ = cs.restPatch("/disk/"+slot, map[string]any{
+			"nvmeTcpExport": true,
+			"nvmeTcpPort":   targetPortInt,
 		}, localRestURL, localUsername, localPassword)
 
 	} else {
 		// MikroTik: create file-backed disk; then enable export via PATCH/SET; then compression via /disk/set
-		diskData := map[string]string{
+		diskData := map[string]any{
 			"type":      "file",
 			"file-path": imgPath,
 			"file-size": sizeGiB,
@@ -307,15 +312,15 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		}
 
 		// Enable export
-		if err := cs.restPatch("/disk/"+diskID, map[string]string{
+		if err := cs.restPatch("/disk/"+diskID, map[string]any{
 			"nvme-tcp-export": "yes",
-			"nvme-tcp-port":   targetPort,
+			"nvme-tcp-port":   targetPortStr,
 		}, localRestURL, localUsername, localPassword); err != nil {
 			klog.Warningf("PATCH export failed, trying SET: %v", err)
-			if err2 := cs.restPost("/disk/set", map[string]string{
+			if err2 := cs.restPost("/disk/set", map[string]any{
 				"numbers":         diskID,
 				"nvme-tcp-export": "yes",
-				"nvme-tcp-port":   targetPort,
+				"nvme-tcp-port":   targetPortStr,
 			}, localRestURL, localUsername, localPassword); err2 != nil {
 				_ = cs.restDelete("/disk/"+diskID, localRestURL, localUsername, localPassword)
 				if !skipSubvol {
@@ -329,7 +334,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		compressValue := getEffectiveCompress(params)
 		compressForContext = compressValue
 		if compressValue != "" {
-			if err := cs.restPost("/disk/set", map[string]string{
+			if err := cs.restPost("/disk/set", map[string]any{
 				"numbers":  diskID,
 				"compress": compressValue,
 			}, localRestURL, localUsername, localPassword); err != nil {
@@ -343,7 +348,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 		}
 
 		// Comment
-		if err := cs.restPost("/disk/set", map[string]string{
+		if err := cs.restPost("/disk/set", map[string]any{
 			"numbers": diskID,
 			"comment": comment,
 		}, localRestURL, localUsername, localPassword); err != nil {
@@ -355,7 +360,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 
 	volCtx := map[string]string{
 		"targetTrAddr":              targetAddr,
-		"targetTrPort":              targetPort,
+		"targetTrPort":              targetPortStr,
 		"targetTrType":              "tcp",
 		"nqn":                       slot,
 		"deviceID":                  slot,
@@ -398,22 +403,23 @@ func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
 
 	// Disable export + delete disk
 	if cs.provider == ProviderNvmeProxy {
-		_ = cs.restPatch("/disk/"+slot, map[string]string{"nvmeTcpExport": "false"}, restURL, username, password)
+		// IMPORTANT: nvmeTcpExport should be bool false, not string "false"
+		_ = cs.restPatch("/disk/"+slot, map[string]any{"nvmeTcpExport": false}, restURL, username, password)
 		_ = cs.restDelete("/disk/"+slot, restURL, username, password)
 	} else {
 		diskID, _ := cs.getDiskID(slot, restURL, username, password)
 		if diskID != "" {
-			_ = cs.restPatch("/disk/"+diskID, map[string]string{"nvme-tcp-export": "no"}, restURL, username, password)
+			_ = cs.restPatch("/disk/"+diskID, map[string]any{"nvme-tcp-export": "no"}, restURL, username, password)
 			_ = cs.restDelete("/disk/"+diskID, restURL, username, password)
 		} else {
 			// best-effort fallback
-			_ = cs.restPatch("/disk/"+slot, map[string]string{"nvme-tcp-export": "no"}, restURL, username, password)
+			_ = cs.restPatch("/disk/"+slot, map[string]any{"nvme-tcp-export": "no"}, restURL, username, password)
 			_ = cs.restDelete("/disk/"+slot, restURL, username, password)
 		}
-
-		// Only MikroTik path manages BTRFS subvolumes; nvme-proxy may be ZFS and will 404 here.
-		_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, restURL, username, password)
 	}
+
+	// Delete subvolume (no-op-ish for nvme-proxy zfs backend; the endpoint might not exist)
+	_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, restURL, username, password)
 
 	klog.V(4).Infof("Deletion completed for volume %s (best-effort)", volumeID)
 	return &csi.DeleteVolumeResponse{}, nil
