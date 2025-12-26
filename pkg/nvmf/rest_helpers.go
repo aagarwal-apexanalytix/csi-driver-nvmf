@@ -3,6 +3,7 @@ package nvmf
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,31 @@ import (
 
 	"k8s.io/klog/v2"
 )
+
+type RestError struct {
+	Method     string
+	URL        string
+	StatusCode int
+	Body       []byte
+}
+
+func (e *RestError) Error() string {
+	trim := strings.TrimSpace(string(e.Body))
+	if trim == "" {
+		trim = "<empty body>"
+	}
+	return fmt.Sprintf("REST %s %s error %d: %s", e.Method, e.URL, e.StatusCode, trim)
+}
+
+func (e *RestError) BodyString() string { return strings.TrimSpace(string(e.Body)) }
+
+func IsRestStatus(err error, code int) bool {
+	var re *RestError
+	if errors.As(err, &re) {
+		return re.StatusCode == code
+	}
+	return false
+}
 
 func (cs *ControllerServer) restDo(method, url string, body []byte, username, password string) ([]byte, error) {
 	var reader io.Reader
@@ -35,9 +61,15 @@ func (cs *ControllerServer) restDo(method, url string, body []byte, username, pa
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode >= 300 {
-		klog.Errorf("REST %s %s error %d: %s", method, url, resp.StatusCode, string(respBody))
-		return nil, fmt.Errorf("REST error %d: %s", resp.StatusCode, string(respBody))
+		klog.Errorf("REST %s %s error %d: %s", method, url, resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return nil, &RestError{
+			Method:     method,
+			URL:        url,
+			StatusCode: resp.StatusCode,
+			Body:       respBody,
+		}
 	}
 	return respBody, nil
 }
