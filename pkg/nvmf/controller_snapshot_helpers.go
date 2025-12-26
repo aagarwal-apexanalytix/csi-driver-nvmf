@@ -1,3 +1,7 @@
+// Package nvmf controller_snapshot_helpers.go
+//
+// Update: for nvme-proxy, do not parse fstype from BTRFS comment using subvols.
+// The helper below still works (it reads disk "comment"), but handleContentSource now blocks nvme-proxy.
 package nvmf
 
 import (
@@ -42,6 +46,11 @@ func (cs *ControllerServer) getSourceFstype(sourceVolID string, restURL string, 
 func (cs *ControllerServer) handleContentSource(contentSource *csi.VolumeContentSource, localRestURL, localUsername, localPassword string, fstype *string) (string, int64, string, error) {
 	if contentSource == nil {
 		return "", 0, "", nil
+	}
+
+	// nvme-proxy content source should use nvme-proxy snapshot/clone endpoints, not BTRFS subvols.
+	if cs.provider == ProviderNvmeProxy {
+		return "", 0, "", status.Error(codes.Unimplemented, "ContentSource not implemented for nvme-proxy in this CSI controller")
 	}
 
 	var parentSubvol string

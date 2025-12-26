@@ -1,3 +1,6 @@
+// Package nvmf controller_snapshot.go
+//
+// Update: Do not call BTRFS subvolume APIs for nvme-proxy (keep for MikroTik only).
 package nvmf
 
 import (
@@ -42,10 +45,10 @@ func (cs *ControllerServer) CreateSnapshot(_ context.Context, req *csi.CreateSna
 	if cs.provider == ProviderStatic {
 		return nil, status.Error(codes.Unimplemented, "Snapshots not supported in static mode")
 	}
-	// If nvme-proxy backend is zfs, snapshots should be implemented in nvme-proxy API (not BTRFS subvol).
-	// For now, keep BTRFS subvol snapshots only.
-	if cs.provider == ProviderNvmeProxy && strings.EqualFold(cs.backendMount, "zfs") {
-		return nil, status.Error(codes.Unimplemented, "Snapshots not implemented for nvme-proxy zfs backend")
+
+	// ✅ nvme-proxy snapshots are handled by nvme-proxy snapshot API, not BTRFS subvol calls.
+	if cs.provider == ProviderNvmeProxy {
+		return nil, status.Error(codes.Unimplemented, "Snapshots not implemented for nvme-proxy in this CSI controller (use nvme-proxy snapshot endpoints)")
 	}
 
 	params := req.GetParameters()
@@ -119,6 +122,11 @@ func (cs *ControllerServer) DeleteSnapshot(_ context.Context, req *csi.DeleteSna
 		return &csi.DeleteSnapshotResponse{}, nil
 	}
 
+	// ✅ nvme-proxy snapshots should be deleted via nvme-proxy API, not BTRFS subvol calls.
+	if cs.provider == ProviderNvmeProxy {
+		return &csi.DeleteSnapshotResponse{}, nil
+	}
+
 	_ = cs.restDelete("/disk/btrfs/subvolume/"+snapSubVol, cs.restURL, cs.username, cs.password)
 	return &csi.DeleteSnapshotResponse{}, nil
 }
@@ -128,8 +136,9 @@ func (cs *ControllerServer) ListSnapshots(_ context.Context, req *csi.ListSnapsh
 	if cs.provider == ProviderStatic {
 		return &csi.ListSnapshotsResponse{}, nil
 	}
-	// For nvme-proxy zfs, not implemented here.
-	if cs.provider == ProviderNvmeProxy && strings.EqualFold(cs.backendMount, "zfs") {
+
+	// ✅ nvme-proxy snapshots should be listed via nvme-proxy snapshot endpoints, not BTRFS subvol calls.
+	if cs.provider == ProviderNvmeProxy {
 		return &csi.ListSnapshotsResponse{}, nil
 	}
 

@@ -1,3 +1,4 @@
+// Package nvmf controller_validate_publish.go
 package nvmf
 
 import (
