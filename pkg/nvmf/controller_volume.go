@@ -232,10 +232,11 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	klog.V(4).Infof("Provisioning new volume %s (slot=%s, size=%s)%s", req.Name, slot, sizeGiB, cloneInfo)
 
 	// nvme-proxy can be BTRFS OR ZFS; if backendMount == "zfs" skip BTRFS subvol calls entirely
-	skipSubvol := (cs.provider == ProviderNvmeProxy && strings.EqualFold(backendMount, "zfs"))
+	skipSubvol := cs.provider == ProviderNvmeProxy && strings.EqualFold(backendMount, "zfs")
 
-	// Create BTRFS subvolume (empty or snapshot) if applicable
-	if !skipSubvol {
+	// Only MikroTik provider manages BTRFS subvolumes via RouterOS endpoints.
+	// For nvme-proxy, the server manages its backend (BTRFS or ZFS) internally.
+	if cs.provider != ProviderNvmeProxy {
 		subvolData := map[string]string{"fs": backendDisk, "name": subVolName}
 		if parentSubvol != "" {
 			subvolData["parent"] = parentSubvol
