@@ -1,3 +1,4 @@
+// Package nvmf
 package nvmf
 
 import (
@@ -408,10 +409,10 @@ func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
 			_ = cs.restPatch("/disk/"+slot, map[string]string{"nvme-tcp-export": "no"}, restURL, username, password)
 			_ = cs.restDelete("/disk/"+slot, restURL, username, password)
 		}
-	}
 
-	// Delete subvolume (no-op-ish for nvme-proxy zfs backend; the endpoint might not exist)
-	_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, restURL, username, password)
+		// Only MikroTik path manages BTRFS subvolumes; nvme-proxy may be ZFS and will 404 here.
+		_ = cs.restDelete("/disk/btrfs/subvolume/"+subVolName, restURL, username, password)
+	}
 
 	klog.V(4).Infof("Deletion completed for volume %s (best-effort)", volumeID)
 	return &csi.DeleteVolumeResponse{}, nil
