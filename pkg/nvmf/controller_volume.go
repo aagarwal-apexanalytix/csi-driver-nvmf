@@ -49,7 +49,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	if targetPortStr == "" {
 		targetPortStr = defaultTargetPort
 	}
-	targetPortInt, err := strconv.Atoi(targetPortStr)
+	targetPortInt, err := strconv.Atoi(strings.TrimSpace(targetPortStr))
 	if err != nil || targetPortInt <= 0 || targetPortInt > 65535 {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid targetPort %q (must be 1-65535)", targetPortStr)
 	}
@@ -105,10 +105,10 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 
 	// nvme-proxy often runs with no auth; static doesn't require auth
 	if cs.provider != ProviderNvmeProxy && cs.provider != ProviderStatic {
-		if localUsername == "" {
+		if strings.TrimSpace(localUsername) == "" {
 			return nil, status.Error(codes.InvalidArgument, "username required (no global configured)")
 		}
-		if localPassword == "" {
+		if strings.TrimSpace(localPassword) == "" {
 			return nil, status.Error(codes.InvalidArgument, "password required (no global configured)")
 		}
 	}
@@ -237,7 +237,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	klog.V(4).Infof("Provisioning new volume %s (slot=%s, size=%s)%s", req.Name, slot, sizeGiB, cloneInfo)
 
 	// nvme-proxy can be BTRFS OR ZFS; if backendMount == "zfs" skip BTRFS subvol calls entirely
-	skipSubvol := (cs.provider == ProviderNvmeProxy && strings.EqualFold(backendMount, "zfs"))
+	skipSubvol := (cs.provider == ProviderNvmeProxy && strings.EqualFold(strings.TrimSpace(backendMount), "zfs"))
 
 	// Create BTRFS subvolume (empty or snapshot) if applicable
 	if !skipSubvol {
@@ -260,12 +260,15 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 	// Provider-specific disk create + export
 	if cs.provider == ProviderNvmeProxy {
 		// nvme-proxy: POST /disk/add
-		// IMPORTANT: nvmeTcpPort must be int, nvmeTcpExport should be bool.
+		//
+		// IMPORTANT: server-side types (per your errors):
+		// - nvmeTcpPort: int
+		// - nvmeTcpExport: string ("yes"/"no" or "true"/"false" depending on server; "yes" is safest)
 		diskData := map[string]any{
 			"slot":          slot,
 			"fileSize":      sizeGiB,
 			"comment":       comment,
-			"nvmeTcpExport": true,
+			"nvmeTcpExport": "yes",
 			"nvmeTcpPort":   targetPortInt,
 		}
 		if c := nvmeProxyCompressFromParams(params); c != "" {
@@ -283,7 +286,7 @@ func (cs *ControllerServer) CreateVolume(_ context.Context, req *csi.CreateVolum
 
 		// best-effort ensure export enabled (types matter)
 		_ = cs.restPatch("/disk/"+slot, map[string]any{
-			"nvmeTcpExport": true,
+			"nvmeTcpExport": "yes",
 			"nvmeTcpPort":   targetPortInt,
 		}, localRestURL, localUsername, localPassword)
 
@@ -403,8 +406,8 @@ func (cs *ControllerServer) DeleteVolume(_ context.Context, req *csi.DeleteVolum
 
 	// Disable export + delete disk
 	if cs.provider == ProviderNvmeProxy {
-		// IMPORTANT: nvmeTcpExport should be bool false, not string "false"
-		_ = cs.restPatch("/disk/"+slot, map[string]any{"nvmeTcpExport": false}, restURL, username, password)
+		// IMPORTANT: server-side expects STRING for nvmeTcpExport (per your error)
+		_ = cs.restPatch("/disk/"+slot, map[string]any{"nvmeTcpExport": "no"}, restURL, username, password)
 		_ = cs.restDelete("/disk/"+slot, restURL, username, password)
 	} else {
 		diskID, _ := cs.getDiskID(slot, restURL, username, password)
@@ -457,7 +460,7 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 
 	if cs.provider == ProviderNvmeProxy {
 		// nvme-proxy expects PATCH /disk/<slot> with "fileSize"
-		if err := cs.restPatch("/disk/"+volumeID, map[string]string{"fileSize": newGiB}, restURL, username, password); err != nil {
+		if err := cs.restPatch("/disk/"+volumeID, map[string]any{"fileSize": newGiB}, restURL, username, password); err != nil {
 			return nil, status.Errorf(codes.Internal, "Expand failed (nvme-proxy): %v", err)
 		}
 	} else {
@@ -465,9 +468,9 @@ func (cs *ControllerServer) ControllerExpandVolume(_ context.Context, req *csi.C
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "Failed to get disk .id for expansion: %v", err)
 		}
-		if err := cs.restPatch("/disk/"+diskID, map[string]string{"file-size": newGiB}, restURL, username, password); err != nil {
+		if err := cs.restPatch("/disk/"+diskID, map[string]any{"file-size": newGiB}, restURL, username, password); err != nil {
 			// fallback to SET
-			if err2 := cs.restPost("/disk/set", map[string]string{
+			if err2 := cs.restPost("/disk/set", map[string]any{
 				"numbers":   diskID,
 				"file-size": newGiB,
 			}, restURL, username, password); err2 != nil {
