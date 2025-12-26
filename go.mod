@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/container-storage-interface/spec v1.12.0
+	github.com/csi-addons/spec v0.2.1-0.20250610152019-b5a7205f6a79
 	github.com/kubernetes-csi/csi-lib-utils v0.23.0
 	golang.org/x/net v0.48.0
 	google.golang.org/grpc v1.78.0

@@ -49,12 +49,26 @@ func NewDriver(conf *GlobalConfig) *driver {
 		klog.Fatal("NodeID must be specified")
 	}
 	klog.Infof("Initializing CSI driver: %s version: %s nodeID: %s", conf.DriverName, conf.Version, conf.NodeID)
+
 	return &driver{
 		name:         conf.DriverName,
 		version:      conf.Version,
 		nodeId:       conf.NodeID,
 		region:       conf.Region,
 		volumeMapDir: conf.NVMfVolumeMapDir,
+	}
+}
+
+func normalizeProvider(p string) string {
+	p = strings.ToLower(strings.TrimSpace(p))
+	switch p {
+	case ProviderStatic, ProviderMikroTik, ProviderNvmeProxy:
+		return p
+	case "":
+		return ProviderStatic
+	default:
+		klog.Warningf("Unknown CSI_PROVIDER=%q; defaulting to %q", p, ProviderStatic)
+		return ProviderStatic
 	}
 }
 
@@ -77,31 +91,36 @@ func (d *driver) Run(conf *GlobalConfig) {
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
 	})
 
+	// Controller capabilities should match what ControllerServer reports + implements.
 	if conf.IsControllerServer {
+		provider := normalizeProvider(os.Getenv("CSI_PROVIDER"))
+
 		caps := []csi.ControllerServiceCapability_RPC_Type{
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 			csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 			csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 			csi.ControllerServiceCapability_RPC_GET_VOLUME,
+			csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 		}
 
-		// Conditional capabilities based on provider (static vs dynamic/MikroTik)
-		provider := strings.ToLower(os.Getenv("CSI_PROVIDER"))
-		if provider != "static" {
+		// Dynamic features: supported in mikrotik/nvme-proxy modes; not in static mode.
+		if provider != ProviderStatic {
 			caps = append(caps,
 				csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
-				csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 				csi.ControllerServiceCapability_RPC_MODIFY_VOLUME,
+				csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 				csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 				csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 				csi.ControllerServiceCapability_RPC_GET_SNAPSHOT,
 			)
 		}
+
 		d.AddControllerServiceCapabilities(caps)
 	}
 
 	d.idServer = NewIdentityServer(d)
 	d.nodeServer = NewNodeServer(d)
+
 	if conf.IsControllerServer {
 		d.controllerServer = NewControllerServer(d)
 	}
