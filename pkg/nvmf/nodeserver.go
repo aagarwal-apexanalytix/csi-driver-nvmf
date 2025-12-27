@@ -1,4 +1,6 @@
-/* Copyright 2021 The Kubernetes Authors.
+/*
+Copyright 2021 The Kubernetes Authors.
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -16,13 +18,12 @@ package nvmf
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-driver-nvmf/pkg/utils"
@@ -66,8 +67,8 @@ func ensureFile(p string) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0750); err != nil {
 		return err
 	}
-	// Create if missing, but don't truncate.
-	f, err := os.OpenFile(p, os.O_CREATE, 0600)
+	// Create if missing, but don't truncate. Must include a write flag with O_CREATE.
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
@@ -75,23 +76,39 @@ func ensureFile(p string) error {
 }
 
 // bindMount mounts source -> target with bind (+ optional ro remount).
+// Uses SafeFormatAndMount's IsLikelyNotMountPoint for robust checks across file/dir targets.
 func bindMount(mounter mount.Interface, source, target string, readOnly bool) error {
-	notMounted, err := mount.IsNotMountPoint(mounter, target)
+	safe := &mount.SafeFormatAndMount{Interface: mounter, Exec: exec.New()}
+
+	// If already mounted, ensure ro if requested and return success.
+	notMounted, err := safe.IsLikelyNotMountPoint(target)
 	if err == nil && !notMounted {
+		if readOnly {
+			// For remount, use target as "source" (safer across implementations).
+			_ = mounter.Mount(target, target, "", []string{"remount", "bind", "ro"})
+		}
 		return nil
 	}
 
+	// Attempt bind mount.
 	if err := mounter.Mount(source, target, "", []string{"bind"}); err != nil {
+		// Tolerate races: re-check mountpoint; if now mounted, treat as success.
+		nm, chkErr := safe.IsLikelyNotMountPoint(target)
+		if chkErr == nil && !nm {
+			if readOnly {
+				_ = mounter.Mount(target, target, "", []string{"remount", "bind", "ro"})
+			}
+			return nil
+		}
 		return err
 	}
 
+	// Enforce RO if requested.
 	if readOnly {
-		// Remount ro to enforce it (common best practice).
-		if err := mounter.Mount(source, target, "", []string{"remount", "bind", "ro"}); err != nil {
+		if err := mounter.Mount(target, target, "", []string{"remount", "bind", "ro"}); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -112,22 +129,27 @@ func (n *NodeServer) stageVolume(req *csi.NodeStageVolumeRequest, devicePath str
 		return fmt.Errorf("volume capability missing")
 	}
 
-	// NOTE: NodeStageVolumeRequest does NOT have Readonly; enforce RO at Publish.
-	stageReadOnly := false
-
-	// ===== BLOCK STAGE =====
+	// BLOCK
 	if isBlock(cap) {
 		stageFile := filepath.Join(staging, "block")
 		if err := ensureFile(stageFile); err != nil {
 			return fmt.Errorf("failed to create staging block file %s: %w", stageFile, err)
 		}
-		if err := bindMount(n.mounter, devicePath, stageFile, stageReadOnly); err != nil {
+
+		// Idempotent: if already mounted, return success.
+		safe := &mount.SafeFormatAndMount{Interface: n.mounter, Exec: exec.New()}
+		notMounted, err := safe.IsLikelyNotMountPoint(stageFile)
+		if err == nil && !notMounted {
+			return nil
+		}
+
+		if err := bindMount(n.mounter, devicePath, stageFile, false); err != nil {
 			return fmt.Errorf("failed to stage block bind mount %s -> %s: %w", devicePath, stageFile, err)
 		}
 		return nil
 	}
 
-	// ===== FILESYSTEM STAGE =====
+	// FILESYSTEM
 	if isMount(cap) {
 		safe := &mount.SafeFormatAndMount{Interface: n.mounter, Exec: exec.New()}
 
@@ -143,8 +165,7 @@ func (n *NodeServer) stageVolume(req *csi.NodeStageVolumeRequest, devicePath str
 		}
 
 		opts := append([]string{}, cap.GetMount().GetMountFlags()...)
-		// stage as rw; publish may remount ro via bind remount
-		opts = append(opts, "rw")
+		opts = append(opts, "rw") // stage as rw; publish enforces ro via bind remount if requested
 
 		notMounted, err := safe.IsLikelyNotMountPoint(staging)
 		if err == nil && !notMounted {
@@ -181,7 +202,7 @@ func (n *NodeServer) publishFromStaging(req *csi.NodePublishVolumeRequest) error
 
 	readOnly := req.GetReadonly()
 
-	// ===== BLOCK PUBLISH =====
+	// BLOCK
 	if isBlock(cap) {
 		if err := ensureFile(target); err != nil {
 			return fmt.Errorf("failed to ensure block target file %s: %w", target, err)
@@ -193,7 +214,7 @@ func (n *NodeServer) publishFromStaging(req *csi.NodePublishVolumeRequest) error
 		return nil
 	}
 
-	// ===== FILESYSTEM PUBLISH =====
+	// FILESYSTEM
 	if isMount(cap) {
 		if err := ensureDir(target); err != nil {
 			return fmt.Errorf("failed to ensure mount target dir %s: %w", target, err)
@@ -213,66 +234,62 @@ func (n *NodeServer) unpublishTarget(target string) error {
 	notMounted, err := safe.IsLikelyNotMountPoint(target)
 	if err == nil && !notMounted {
 		if umErr := safe.Unmount(target); umErr != nil {
+			// Return error so kubelet retries; prevents mount leaks.
 			return fmt.Errorf("failed to unmount target %s: %w", target, umErr)
 		}
 	}
 
-	// best-effort cleanup
-	_ = os.Remove(target)
-	_ = os.Remove(filepath.Dir(target))
+	// Cleanup only the target itself (file for block, dir for fs). Avoid parent dirs.
+	_ = os.RemoveAll(target)
 	return nil
 }
 
+// unstage cleans up the staging path.
+// Since NodeUnstageVolumeRequest doesn't include cap, we always try block-stage-file first.
 func (n *NodeServer) unstage(staging string, cap *csi.VolumeCapability) error {
 	safe := &mount.SafeFormatAndMount{Interface: n.mounter, Exec: exec.New()}
-
 	if staging == "" {
 		return nil
 	}
 
-	if cap != nil && isBlock(cap) {
-		stageFile := filepath.Join(staging, "block")
+	// Try block staging file first (covers unknown cap case).
+	stageFile := filepath.Join(staging, "block")
+	if _, statErr := os.Stat(stageFile); statErr == nil {
 		notMounted, err := safe.IsLikelyNotMountPoint(stageFile)
 		if err == nil && !notMounted {
-			_ = safe.Unmount(stageFile)
+			if umErr := safe.Unmount(stageFile); umErr != nil {
+				return fmt.Errorf("failed to unmount staging block file %s: %w", stageFile, umErr)
+			}
 		}
-		_ = os.Remove(stageFile)
-	} else {
-		notMounted, err := safe.IsLikelyNotMountPoint(staging)
-		if err == nil && !notMounted {
-			_ = safe.Unmount(staging)
+		_ = os.RemoveAll(stageFile)
+	}
+
+	// If cap explicitly says block, we're done after stageFile cleanup.
+	if cap != nil && isBlock(cap) {
+		_ = os.RemoveAll(staging)
+		return nil
+	}
+
+	// Treat staging as directory mount for filesystem staging.
+	notMounted, err := safe.IsLikelyNotMountPoint(staging)
+	if err == nil && !notMounted {
+		if umErr := safe.Unmount(staging); umErr != nil {
+			return fmt.Errorf("failed to unmount staging path %s: %w", staging, umErr)
 		}
 	}
 
-	_ = os.Remove(staging)
+	_ = os.RemoveAll(staging)
 	return nil
 }
 
 func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	klog.V(4).Infof("NodeGetCapabilities called")
-
 	return &csi.NodeGetCapabilitiesResponse{
 		Capabilities: []*csi.NodeServiceCapability{
-			{
-				Type: &csi.NodeServiceCapability_Rpc{
-					Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME},
-				},
-			},
-			{
-				Type: &csi.NodeServiceCapability_Rpc{
-					Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_EXPAND_VOLUME},
-				},
-			},
-			{
-				Type: &csi.NodeServiceCapability_Rpc{
-					Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS},
-				},
-			},
-			{
-				Type: &csi.NodeServiceCapability_Rpc{
-					Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP},
-				},
-			},
+			{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME}}},
+			{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_EXPAND_VOLUME}}},
+			{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS}}},
+			{Type: &csi.NodeServiceCapability_Rpc{Rpc: &csi.NodeServiceCapability_RPC{Type: csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP}}},
 		},
 	}, nil
 }
@@ -324,18 +341,19 @@ func (n *NodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolume
 	}
 	klog.V(4).Infof("NodeStageVolume: volume %s connected at device %s", volumeID, devicePath)
 
-	// Persist connector info (so Unstage can disconnect even after restart)
+	// Persist connector info (so Unstage/Expand can recover NQN/device even after restart)
 	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
 	if err := persistConnectorFile(connector, connectorFilePath); err != nil {
+		// Best-effort disconnect; return error so kubelet retries.
 		_ = connector.Disconnect()
-		removeConnectorFile(connectorFilePath)
+		_ = os.Remove(connectorFilePath)
 		return nil, status.Errorf(codes.Internal, "failed to persist connector for volume %s: %v", volumeID, err)
 	}
 
-	// CSI-textbook staging: mount/prepare at stagingTargetPath
+	// Stage mount/bind.
 	if err := n.stageVolume(req, devicePath); err != nil {
-		_ = connector.Disconnect()
-		removeConnectorFile(connectorFilePath)
+		// IMPORTANT: do NOT disconnect here. Many staging errors are transient and kubelet will retry.
+		// Keeping the connection + connector file avoids connect/disconnect flapping.
 		return nil, status.Errorf(codes.Internal, "failed to stage volume %s: %v", volumeID, err)
 	}
 
@@ -346,30 +364,38 @@ func (n *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVo
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is nil")
 	}
-
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
-
-	isEph := strings.HasPrefix(volumeID, "ephemeral-")
-	klog.V(4).Infof("NodeUnstageVolume: unstaging+disconnecting volume %s%s", volumeID,
-		map[bool]string{true: " (ephemeral)", false: ""}[isEph])
-
-	// NodeUnstageVolumeRequest doesn't carry VolumeCapability (CSI v1.12), so best-effort unstage:
-	_ = n.unstage(req.GetStagingTargetPath(), nil)
-
-	// Disconnect using persisted connector info (best-effort)
-	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
-	connector, err := GetConnectorFromFile(connectorFilePath)
-	if err == nil {
-		_ = connector.Disconnect()
-		removeConnectorFile(connectorFilePath)
-		klog.V(4).Infof("NodeUnstageVolume: disconnected and cleaned up persisted info for volume %s", volumeID)
-	} else {
-		klog.V(5).Infof("NodeUnstageVolume: no persisted connector found for volume %s (already cleaned)", volumeID)
+	if req.GetStagingTargetPath() == "" {
+		return nil, status.Error(codes.InvalidArgument, "StagingTargetPath missing in request")
 	}
 
+	staging := req.GetStagingTargetPath()
+
+	// Unstage (return errors so kubelet retries; prevents mount leaks)
+	if err := n.unstage(staging, nil); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to unstage volume %s: %v", volumeID, err)
+	}
+
+	// Disconnect using persisted connector info.
+	// IMPORTANT: only remove connector file if disconnect succeeded.
+	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
+	connector, err := GetConnectorFromFile(connectorFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &csi.NodeUnstageVolumeResponse{}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "failed to read connector file for volume %s: %v", volumeID, err)
+	}
+
+	if derr := connector.Disconnect(); derr != nil {
+		// Keep connector file so kubelet retry can attempt again.
+		return nil, status.Errorf(codes.Internal, "failed to disconnect volume %s: %v", volumeID, derr)
+	}
+
+	removeConnectorFile(connectorFilePath)
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
@@ -402,11 +428,9 @@ func (n *NodeServer) NodePublishVolume(_ context.Context, req *csi.NodePublishVo
 		klog.V(4).Infof("NodePublishVolume: publishing volume %s to %s", volumeID, targetPath)
 	}
 
-	// CSI-textbook publish: bind mount from staging -> target
 	if err := n.publishFromStaging(req); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to publish volume %s: %v", volumeID, err)
 	}
-
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -421,18 +445,9 @@ func (n *NodeServer) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpubli
 		return nil, status.Error(codes.InvalidArgument, "Target Path missing in request")
 	}
 
-	targetPath := req.GetTargetPath()
-	volumeID := req.GetVolumeId()
-	isEph := strings.HasPrefix(volumeID, "ephemeral-")
-
-	klog.V(4).Infof("NodeUnpublishVolume: unpublishing volume %s at %s%s", volumeID, targetPath,
-		map[bool]string{true: " (ephemeral)", false: ""}[isEph])
-
-	if err := n.unpublishTarget(targetPath); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to unpublish volume %s: %v", volumeID, err)
+	if err := n.unpublishTarget(req.GetTargetPath()); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to unpublish volume %s: %v", req.GetVolumeId(), err)
 	}
-
-	klog.V(4).Infof("NodeUnpublishVolume: successfully unpublished volume %s", volumeID)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -450,38 +465,27 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 	if req.GetCapacityRange() != nil {
 		requiredBytes = req.GetCapacityRange().GetRequiredBytes()
 	}
+
 	klog.V(4).Infof("NodeExpandVolume called for volume %s (volumePath=%s, requiredBytes=%d)", volumeID, volumePath, requiredBytes)
 
 	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
-	var devicePath string
-	var err error
 
-	_, devicePath, err = getNvmeInfoByNqn(volumeID)
-	if err == nil && devicePath != "" {
-		klog.V(4).Infof("Found existing device %s for volume %s", devicePath, volumeID)
-	} else {
-		klog.V(4).Infof("Device lookup failed for volume %s, attempting recovery", volumeID)
-		connector, loadErr := GetConnectorFromFile(connectorFilePath)
-		if loadErr != nil {
-			return nil, status.Errorf(codes.FailedPrecondition, "volume %s not connected and recovery failed", volumeID)
-		}
-		recoveredDevice, reconErr := connector.Connect()
-		if reconErr != nil || recoveredDevice == "" {
-			return nil, status.Errorf(codes.Internal, "recovery reconnect failed for volume %s", volumeID)
-		}
-		for i := 0; i < 30; i++ {
-			_, devicePath, err = getNvmeInfoByNqn(volumeID)
-			if err == nil && devicePath != "" {
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
-		if devicePath == "" {
-			return nil, status.Errorf(codes.Internal, "device not found after recovery for volume %s", volumeID)
-		}
+	connector, loadErr := GetConnectorFromFile(connectorFilePath)
+	if loadErr != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "failed to load connector for volume %s: %v", volumeID, loadErr)
+	}
+	if connector.TargetNqn == "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "connector missing TargetNqn for volume %s", volumeID)
+	}
+	nqn := connector.TargetNqn
+
+	// Lookup device by NQN (do NOT Connect() here)
+	_, devicePath, derr := getNvmeInfoByNqn(nqn)
+	if derr != nil || devicePath == "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "device not found for volume %s (nqn=%s): %v", volumeID, nqn, derr)
 	}
 
-	// Rescan controllers
+	// Rescan controller(s) that match this NQN
 	const ctlPath = "/sys/class/nvme-fabrics/ctl"
 	if entries, err := os.ReadDir(ctlPath); err == nil {
 		for _, entry := range entries {
@@ -493,13 +497,13 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 			if err != nil {
 				continue
 			}
-			if strings.TrimSpace(string(data)) == volumeID {
+			if strings.TrimSpace(string(data)) == nqn {
 				scanPath := filepath.Join(ctlPath, entry.Name(), "rescan_controller")
 				if utils.IsFileExisting(scanPath) {
 					if file, err := os.OpenFile(scanPath, os.O_WRONLY, 0666); err == nil {
 						defer file.Close()
 						_, _ = file.WriteString("1")
-						klog.V(4).Infof("Triggered rescan for controller %s", entry.Name())
+						klog.V(4).Infof("Triggered rescan for controller %s (nqn=%s)", entry.Name(), nqn)
 					}
 				}
 			}
@@ -534,9 +538,29 @@ func (n *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolu
 		}
 	}
 
+	// Return actual size when possible (CSI expects current capacity after expansion).
+	capBytes := requiredBytes
+	if sz, szErr := getBlockSizeBytes(devicePath); szErr == nil && sz > 0 {
+		capBytes = sz
+	}
+
 	return &csi.NodeExpandVolumeResponse{
-		CapacityBytes: requiredBytes,
+		CapacityBytes: capBytes,
 	}, nil
+}
+
+func getBlockSizeBytes(devicePath string) (int64, error) {
+	exe := exec.New()
+	out, err := exe.Command("blockdev", "--getsize64", devicePath).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("blockdev --getsize64 %s failed: %v (out=%s)", devicePath, err, strings.TrimSpace(string(out)))
+	}
+	s := strings.TrimSpace(string(out))
+	v, convErr := strconv.ParseInt(s, 10, 64)
+	if convErr != nil {
+		return 0, fmt.Errorf("parse blockdev size %q: %w", s, convErr)
+	}
+	return v, nil
 }
 
 func getFSType(devicePath string) string {
@@ -589,29 +613,38 @@ func (n *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolum
 		return nil, status.Errorf(codes.Internal, "Failed to stat volume path %s: %v", volumePath, err)
 	}
 
-	var usage []*csi.VolumeUsage
 	condition := &csi.VolumeCondition{Abnormal: false, Message: "Volume is healthy"}
+	var usage []*csi.VolumeUsage
 
-	// Best-effort NVMe connection check
+	// Resolve NQN from persisted connector file (VolumeID != NQN)
 	connectorFilePath := path.Join(DefaultVolumeMapPath, volumeID+".json")
-	if _, err := os.Stat(connectorFilePath); err == nil {
-		_, devicePath, lookupErr := getNvmeInfoByNqn(volumeID)
-		if lookupErr != nil || devicePath == "" {
+	var nqn string
+	if connector, lerr := GetConnectorFromFile(connectorFilePath); lerr == nil && connector != nil && connector.TargetNqn != "" {
+		nqn = connector.TargetNqn
+	} else if lerr != nil && !os.IsNotExist(lerr) {
+		condition.Abnormal = true
+		condition.Message = "Failed to read persisted connector state"
+		klog.Warningf("Failed to read connector file for volume %s: %v", volumeID, lerr)
+	}
+
+	// Best-effort resolve NVMe block device via NQN (if available)
+	var nqnDev string
+	if nqn != "" {
+		_, dev, derr := getNvmeInfoByNqn(nqn)
+		if derr != nil || dev == "" {
 			condition.Abnormal = true
 			condition.Message = "Underlying NVMe device disconnected or unavailable"
-			klog.Warningf("Volume %s condition abnormal: device lookup failed (%v)", volumeID, lookupErr)
+			klog.Warningf("Volume %s condition abnormal: device lookup failed (nqn=%s, err=%v)", volumeID, nqn, derr)
+		} else {
+			nqnDev = dev
 		}
-	} else if !os.IsNotExist(err) {
-		klog.Warningf("Failed to stat persisted connector file for volume %s: %v", volumeID, err)
 	}
 
 	if st.IsDir() {
 		var statfs syscall.Statfs_t
 		if err := syscall.Statfs(volumePath, &statfs); err != nil {
-			if !condition.Abnormal {
-				condition.Abnormal = true
-				condition.Message = "Failed to retrieve filesystem statistics"
-			}
+			condition.Abnormal = true
+			condition.Message = "Failed to retrieve filesystem statistics"
 			klog.Errorf("Failed to get filesystem stats for %s: %v", volumePath, err)
 		} else {
 			totalBytes := int64(statfs.Blocks * uint64(statfs.Bsize))
@@ -620,30 +653,23 @@ func (n *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolum
 			totalInodes := int64(statfs.Files)
 			freeInodes := int64(statfs.Ffree)
 			usedInodes := totalInodes - freeInodes
+
 			usage = []*csi.VolumeUsage{
 				{Unit: csi.VolumeUsage_BYTES, Total: totalBytes, Available: availableBytes, Used: usedBytes},
 				{Unit: csi.VolumeUsage_INODES, Total: totalInodes, Available: freeInodes, Used: usedInodes},
 			}
 		}
 	} else {
-		// Block stats: best-effort size via Seek (works for block devices on Linux)
-		fd, err := os.Open(volumePath)
-		if err != nil {
-			if !condition.Abnormal {
-				condition.Abnormal = true
-				condition.Message = "Failed to open block device"
-			}
-			return nil, status.Errorf(codes.Internal, "Failed to open block device %s: %v", volumePath, err)
+		// Block stats: prefer the resolved NVMe device (nqnDev), else fall back to volumePath.
+		sizePath := nqnDev
+		if sizePath == "" {
+			sizePath = volumePath
 		}
-		defer fd.Close()
 
-		size, seekErr := fd.Seek(0, io.SeekEnd)
-		if seekErr != nil || size <= 0 {
-			if !condition.Abnormal {
-				condition.Abnormal = true
-				condition.Message = "Failed to determine block device size"
-			}
-			klog.Warningf("Seek failed or returned <=0 for block device %s (err: %v)", volumePath, seekErr)
+		size, derr := getBlockSizeBytes(sizePath)
+		if derr != nil {
+			// Keep it best-effort to avoid noisy false alarms; you can flip to Abnormal=true if you prefer strict.
+			klog.V(4).Infof("Best-effort block size lookup failed for %s (volume %s): %v", sizePath, volumeID, derr)
 			size = 0
 		}
 
