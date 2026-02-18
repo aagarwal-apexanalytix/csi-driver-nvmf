@@ -1,41 +1,36 @@
-# ----------------------------------------------------------------------------
-# Build stage
-# ----------------------------------------------------------------------------
-FROM golang:1.25.5-bookworm AS builder
+# Build stage — runs on native arch, cross-compiles for target (no QEMU)
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+
+ARG TARGETARCH
+ARG TARGETOS=linux
 
 WORKDIR /src
 
-# Install build dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        gcc \
-        make \
-        pkg-config \
-        libudev-dev \
-    && rm -rf /var/lib/apt/lists/*
+COPY go.mod go.sum ./
 
-# Copy source code
-COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-# Build the plugin (assumes Makefile default target builds ./bin/nvmfplugin)
-RUN make
+COPY cmd/ cmd/
+COPY pkg/ pkg/
+COPY vendor/ vendor/
 
-# ----------------------------------------------------------------------------
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -ldflags="-w -s" -o /nvmfplugin ./cmd/nvmfplugin/
+
 # Runtime stage
-# ----------------------------------------------------------------------------
-FROM debian:13
+FROM debian:13-slim
 
-# Install runtime dependencies for multiple filesystem types
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         e2fsprogs \
         xfsprogs \
         btrfs-progs \
         util-linux \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy the built binary from the builder stage
-COPY --from=builder /src/bin/nvmfplugin /nvmfplugin
+COPY --from=builder /nvmfplugin /nvmfplugin
 
 ENTRYPOINT ["/nvmfplugin"]
